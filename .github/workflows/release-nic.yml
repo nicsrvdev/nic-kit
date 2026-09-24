@@ -70,11 +70,21 @@ jobs:
           CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.Version=${NICLINK_TAG}" -o niclink-linux-arm64 ./niclink
 
       - uses: docker/setup-qemu-action@v3
+      # setup-qemu-action 已注册 binfmt，arm64 二进制可直接执行（经 qemu-user 透明转译）。
+      # 不用管道接 head：管道退出码是 head 的，程序 panic 也会被吞掉。这里直接判退出码，
+      # 失败时把完整输出（含 panic）打印出来。
       - name: Smoke check amd64
         working-directory: gosrc
         run: |
-          ./niccore-linux-amd64 run --help 2>&1 | head -3
-          ./niclink-linux-amd64 run --help 2>&1 | head -3
+          ./niccore-linux-amd64 run --help > /tmp/smoke.log 2>&1 || { echo "--- niccore/amd64 FAILED ---"; cat /tmp/smoke.log; exit 1; }
+          ./niclink-linux-amd64 run --help > /tmp/smoke.log 2>&1 || { echo "--- niclink/amd64 FAILED ---"; cat /tmp/smoke.log; exit 1; }
+          echo "smoke amd64 OK"
+      - name: Smoke check arm64 (QEMU)
+        working-directory: gosrc
+        run: |
+          ./niccore-linux-arm64 run --help > /tmp/smoke.log 2>&1 || { echo "--- niccore/arm64 FAILED ---"; cat /tmp/smoke.log; exit 1; }
+          ./niclink-linux-arm64 run --help > /tmp/smoke.log 2>&1 || { echo "--- niclink/arm64 FAILED ---"; cat /tmp/smoke.log; exit 1; }
+          echo "smoke arm64 OK"
 
       - name: Rename with tag
         working-directory: gosrc

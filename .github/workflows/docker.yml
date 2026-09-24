@@ -49,9 +49,10 @@ jobs:
         run: go build -trimpath -ldflags "-s -w" -o /tmp/niclink ./niclink
       - name: Smoke check
         run: |
-          /tmp/niccore --help 2>&1 | head -5
-          /tmp/niclink --help 2>&1 | head -5
-          /tmp/niclink run --help 2>&1 | head -5
+          /tmp/niccore --help > /tmp/smoke.log 2>&1 || { echo "--- niccore FAILED ---"; cat /tmp/smoke.log; exit 1; }
+          /tmp/niclink --help > /tmp/smoke.log 2>&1 || { echo "--- niclink FAILED ---"; cat /tmp/smoke.log; exit 1; }
+          /tmp/niclink run --help > /tmp/smoke.log 2>&1 || { echo "--- niclink run FAILED ---"; cat /tmp/smoke.log; exit 1; }
+          echo "smoke OK"
 
   # 双架构改用原生 runner 并行构建，不再用 QEMU 模拟 arm64：
   # amd64 跑在 ubuntu-latest，arm64 跑在 ubuntu-24.04-arm，各自 push 临时单架构镜像，
@@ -100,6 +101,14 @@ jobs:
             NICLINK_VERSION=${{ steps.tags.outputs.niclink_tag }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # 镜像里的 niclink 是在原生 runner 上编的（arm64 跑在 ubuntu-24.04-arm），
+      # 直接跑一次 --help：既是 smoke，也是和 release 里交叉编译产物的对照。
+      - name: Smoke test image binary
+        run: |
+          docker run --rm "ghcr.io/${{ github.repository }}:tmp-${{ github.sha }}-${{ matrix.arch }}" \
+            /app/.bin/niclink run --help > /tmp/img-smoke.log 2>&1 || { echo "--- image smoke FAILED ---"; cat /tmp/img-smoke.log; exit 1; }
+          echo "image smoke OK"
 
   docker:
     needs: build-image
