@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DevTools · UUID 生成 & JS 混淆</title>
+<script src="https://cdn.jsdelivr.net/npm/javascript-obfuscator@4.3.0/dist/index.browser.js"></script>
+<script>
+  // CDN 失败时回退本地同目录文件
+  if (typeof JavaScriptObfuscator === "undefined") {
+    document.write('<script src="./javascript-obfuscator.js"><\/script>');
+  }
+</script>
+<style>
+  :root {
+    --bg: #0b0f19;
+    --card: rgba(255,255,255,0.04);
+    --card-border: rgba(255,255,255,0.08);
+    --accent: #7c5cff;
+    --accent2: #00d4ff;
+    --text: #e8ecf4;
+    --muted: #8b95a8;
+    --success: #22c55e;
+    --radius: 16px;
+    --shadow: 0 20px 50px rgba(0,0,0,0.4);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+    line-height: 1.6;
+  }
+
+  .bg-canvas {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+  }
+
+  .gradient-orb {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(80px);
+    opacity: 0.35;
+    z-index: 0;
+    animation: float 18s ease-in-out infinite;
+  }
+  .orb1 { width: 420px; height: 420px; background: var(--accent); top: -100px; left: -80px; }
+  .orb2 { width: 360px; height: 360px; background: var(--accent2); bottom: 10%; right: -60px; animation-delay: -6s; }
+  .orb3 { width: 280px; height: 280px; background: #ff6b9d; top: 40%; left: 50%; animation-delay: -12s; }
+
+  @keyframes float {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    33% { transform: translate(30px, -40px) scale(1.05); }
+    66% { transform: translate(-20px, 20px) scale(0.95); }
+  }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: blur(20px);
+    background: rgba(11,15,25,0.75);
+    border-bottom: 1px solid var(--card-border);
+  }
+  .nav {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .logo {
+    font-weight: 700;
+    font-size: 1.25rem;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.5px;
+  }
+  .nav-links { display: flex; gap: 28px; }
+  .nav-links a {
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 0.95rem;
+    transition: color 0.25s;
+    position: relative;
+  }
+  .nav-links a:hover { color: var(--text); }
+  .nav-links a::after {
+    content: '';
+    position: absolute;
+    bottom: -4px; left: 0; width: 0; height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width 0.3s;
+  }
+  .nav-links a:hover::after { width: 100%; }
+
+  main { position: relative; z-index: 1; max-width: 1200px; margin: 0 auto; padding: 40px 24px 80px; }
+
+  .hero {
+    text-align: center;
+    padding: 60px 0 50px;
+    animation: fadeUp 0.8s ease-out;
+  }
+  .hero h1 {
+    font-size: clamp(2.2rem, 5vw, 3.4rem);
+    font-weight: 800;
+    letter-spacing: -1.5px;
+    margin-bottom: 16px;
+    background: linear-gradient(135deg, #fff 30%, var(--accent2) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .hero p {
+    color: var(--muted);
+    font-size: 1.15rem;
+    max-width: 580px;
+    margin: 0 auto 32px;
+  }
+  .hero-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(124,92,255,0.15);
+    border: 1px solid rgba(124,92,255,0.3);
+    padding: 6px 16px;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    color: #c4b5fd;
+    margin-bottom: 24px;
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(30px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .tools-grid {
+    display: grid;
+    grid-template-columns: 1fr 1.45fr;
+    gap: 28px;
+    margin-bottom: 80px;
+  }
+  @media (max-width: 960px) {
+    .tools-grid { grid-template-columns: 1fr; }
+  }
+
+  .tool-card {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius);
+    padding: 28px;
+    backdrop-filter: blur(12px);
+    box-shadow: var(--shadow);
+    transition: transform 0.35s, border-color 0.35s, box-shadow 0.35s;
+    animation: fadeUp 0.9s ease-out both;
+  }
+  .tool-card:nth-child(2) { animation-delay: 0.1s; }
+  .tool-card:hover {
+    transform: translateY(-6px);
+    border-color: rgba(124,92,255,0.4);
+    box-shadow: 0 25px 60px rgba(124,92,255,0.15);
+  }
+
+  .tool-header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 22px;
+  }
+  .tool-icon {
+    width: 48px; height: 48px;
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.4rem;
+    background: linear-gradient(135deg, rgba(124,92,255,0.25), rgba(0,212,255,0.15));
+  }
+  .tool-header h2 { font-size: 1.35rem; font-weight: 700; }
+  .tool-header span { font-size: 0.8rem; color: var(--muted); }
+
+  .btn {
+    border: none;
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.25s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent), #5b3fd4);
+    color: white;
+  }
+  .btn-primary:hover { filter: brightness(1.15); transform: scale(1.03); }
+  .btn-secondary {
+    background: rgba(255,255,255,0.08);
+    color: var(--text);
+    border: 1px solid var(--card-border);
+  }
+  .btn-secondary:hover { background: rgba(255,255,255,0.12); }
+  .btn-sm { padding: 6px 12px; font-size: 0.8rem; }
+  .btn-preset {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--card-border);
+    color: var(--muted);
+  }
+  .btn-preset.active {
+    background: rgba(124,92,255,0.2);
+    border-color: var(--accent);
+    color: #c4b5fd;
+  }
+
+  .uuid-controls, .obf-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+
+  .uuid-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 280px;
+    overflow-y: auto;
+  }
+  .uuid-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(0,0,0,0.25);
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 0.9rem;
+    animation: slideIn 0.3s ease-out;
+  }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateX(-12px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  .uuid-item code { color: #a5b4fc; word-break: break-all; }
+  .copy-btn {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    transition: all 0.2s;
+  }
+  .copy-btn:hover { color: var(--accent2); background: rgba(0,212,255,0.1); }
+  .copy-btn.copied { color: var(--success); }
+
+  textarea {
+    width: 100%;
+    min-height: 130px;
+    background: rgba(0,0,0,0.3);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    color: var(--text);
+    padding: 14px;
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 0.85rem;
+    resize: vertical;
+    outline: none;
+    transition: border-color 0.25s;
+  }
+  textarea:focus { border-color: var(--accent); }
+  #jsOutput { min-height: 160px; }
+
+  .obf-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .checkbox {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.82rem;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .checkbox input { accent-color: var(--accent); width: 15px; height: 15px; }
+
+  .obf-stats {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  .obf-stats span { color: var(--accent2); }
+
+  .status-bar {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-top: 8px;
+    min-height: 1.2em;
+  }
+  .status-bar.error { color: #f87171; }
+  .status-bar.ok { color: var(--success); }
+
+  .section-title {
+    font-size: 1.6rem;
+    font-weight: 700;
+    margin-bottom: 28px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .section-title::before {
+    content: '';
+    width: 4px; height: 24px;
+    background: linear-gradient(180deg, var(--accent), var(--accent2));
+    border-radius: 4px;
+  }
+
+  .bookmarks { margin-bottom: 60px; }
+  .category { margin-bottom: 36px; }
+  .category h3 {
+    font-size: 1.05rem;
+    color: var(--muted);
+    margin-bottom: 16px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+  .bookmark-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 14px;
+  }
+  .bookmark-card {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 16px;
+    text-decoration: none;
+    color: var(--text);
+    transition: all 0.3s;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    position: relative;
+    overflow: hidden;
+  }
+  .bookmark-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, rgba(124,92,255,0.1), transparent);
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .bookmark-card:hover {
+    transform: translateY(-4px);
+    border-color: rgba(124,92,255,0.45);
+    box-shadow: 0 12px 30px rgba(0,0,0,0.3);
+  }
+  .bookmark-card:hover::before { opacity: 1; }
+  .bm-icon {
+    font-size: 1.5rem;
+    width: 36px; height: 36px;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,0.06);
+    border-radius: 10px;
+  }
+  .bm-name { font-weight: 600; font-size: 0.95rem; position: relative; }
+  .bm-desc { font-size: 0.75rem; color: var(--muted); position: relative; }
+
+  footer {
+    text-align: center;
+    padding: 40px 24px;
+    color: var(--muted);
+    font-size: 0.85rem;
+    border-top: 1px solid var(--card-border);
+    position: relative;
+    z-index: 1;
+  }
+
+  .toast {
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%) translateY(80px);
+    background: #1e293b;
+    color: white;
+    padding: 12px 24px;
+    border-radius: 12px;
+    font-size: 0.9rem;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    z-index: 999;
+    opacity: 0;
+    transition: all 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+    pointer-events: none;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25); }
+</style>
+</head>
+<body>
+  <div class="gradient-orb orb1"></div>
+  <div class="gradient-orb orb2"></div>
+  <div class="gradient-orb orb3"></div>
+  <canvas class="bg-canvas" id="particles"></canvas>
+
+  <header>
+    <nav class="nav">
+      <div class="logo">DevTools</div>
+      <div class="nav-links">
+        <a href="#tools">工具</a>
+        <a href="#bookmarks">书签</a>
+        <a href="#about">关于</a>
+      </div>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-badge">🔒 服务端加载 · 专业级混淆 · 零上传</div>
+      <h1>UUID 生成 & 专业 JS 混淆</h1>
+      <p>混淆引擎优先从 CDN 加载，失败时自动回退服务端本地文件；支持控制流平坦化、字符串加密、死代码注入等专业能力，同时保留精选书签导航。</p>
+    </section>
+
+    <section id="tools" class="tools-grid">
+      <!-- UUID -->
+      <div class="tool-card">
+        <div class="tool-header">
+          <div class="tool-icon">🔑</div>
+          <div>
+            <h2>UUID 生成器</h2>
+            <span>RFC 4122 · Version 4</span>
+          </div>
+        </div>
+        <div class="uuid-controls">
+          <button class="btn btn-primary" onclick="generateUUIDs()">生成 UUID</button>
+          <button class="btn btn-secondary" onclick="generateUUIDs(5)">批量 ×5</button>
+          <button class="btn btn-secondary" onclick="clearUUIDs()">清空</button>
+        </div>
+        <div class="uuid-list" id="uuidList">
+          <div class="uuid-item">
+            <code id="firstUuid">点击上方按钮生成</code>
+            <button class="copy-btn" onclick="copyText(this, document.getElementById('firstUuid').textContent)">复制</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 专业混淆 -->
+      <div class="tool-card">
+        <div class="tool-header">
+          <div class="tool-icon">🛡️</div>
+          <div>
+            <h2>专业 JS 混淆</h2>
+            <span>javascript-obfuscator 本地引擎</span>
+          </div>
+        </div>
+
+        <div class="obf-controls">
+          <button class="btn btn-preset active" data-preset="low" onclick="setPreset('low')">低强度</button>
+          <button class="btn btn-preset" data-preset="medium" onclick="setPreset('medium')">中等</button>
+          <button class="btn btn-preset" data-preset="high" onclick="setPreset('high')">高强度</button>
+          <button class="btn btn-primary" onclick="runObfuscate()">开始混淆</button>
+          <button class="btn btn-secondary btn-sm" onclick="copyObfuscated()">复制结果</button>
+        </div>
+
+        <div class="obf-options">
+          <label class="checkbox"><input type="checkbox" id="optCompact" checked> 压缩</label>
+          <label class="checkbox"><input type="checkbox" id="optControlFlow"> 控制流平坦化</label>
+          <label class="checkbox"><input type="checkbox" id="optDeadCode"> 死代码注入</label>
+          <label class="checkbox"><input type="checkbox" id="optStringArray" checked> 字符串数组</label>
+          <label class="checkbox"><input type="checkbox" id="optStringEncode"> 字符串加密</label>
+          <label class="checkbox"><input type="checkbox" id="optSelfDefending"> 自我保护</label>
+          <label class="checkbox"><input type="checkbox" id="optRenameGlobals"> 重命名全局</label>
+          <label class="checkbox"><input type="checkbox" id="optNumbersToExpr"> 数字转表达式</label>
+        </div>
+
+        <textarea id="jsInput" placeholder="粘贴你的 JavaScript 代码..."></textarea>
+        <div class="obf-stats" id="obfStats"></div>
+        <textarea id="jsOutput" placeholder="混淆结果将显示在这里..." readonly></textarea>
+        <div class="status-bar" id="statusBar"></div>
+      </div>
+    </section>
+
+    <!-- 书签 -->
+    <section id="bookmarks" class="bookmarks">
+      <h2 class="section-title">精选书签</h2>
+
+      <div class="category">
+        <h3>🛠 开发工具</h3>
+        <div class="bookmark-grid">
+          <a class="bookmark-card" href="https://github.com" target="_blank" rel="noopener">
+            <div class="bm-icon">🐙</div>
+            <div class="bm-name">GitHub</div>
+            <div class="bm-desc">代码托管与协作</div>
+          </a>
+          <a class="bookmark-card" href="https://codepen.io" target="_blank" rel="noopener">
+            <div class="bm-icon">🖊️</div>
+            <div class="bm-name">CodePen</div>
+            <div class="bm-desc">前端沙盒实验</div>
+          </a>
+          <a class="bookmark-card" href="https://stackoverflow.com" target="_blank" rel="noopener">
+            <div class="bm-icon">📚</div>
+            <div class="bm-name">Stack Overflow</div>
+            <div class="bm-desc">程序员问答社区</div>
+          </a>
+          <a class="bookmark-card" href="https://caniuse.com" target="_blank" rel="noopener">
+            <div class="bm-icon">📊</div>
+            <div class="bm-name">Can I Use</div>
+            <div class="bm-desc">浏览器兼容性查询</div>
+          </a>
+          <a class="bookmark-card" href="https://regex101.com" target="_blank" rel="noopener">
+            <div class="bm-icon">🔍</div>
+            <div class="bm-name">Regex101</div>
+            <div class="bm-desc">正则表达式调试</div>
+          </a>
+          <a class="bookmark-card" href="https://jsonformatter.org" target="_blank" rel="noopener">
+            <div class="bm-icon">📋</div>
+            <div class="bm-name">JSON Formatter</div>
+            <div class="bm-desc">JSON 格式化工具</div>
+          </a>
+        </div>
+      </div>
+
+      <div class="category">
+        <h3>🎨 设计灵感</h3>
+        <div class="bookmark-grid">
+          <a class="bookmark-card" href="https://dribbble.com" target="_blank" rel="noopener">
+            <div class="bm-icon">🏀</div>
+            <div class="bm-name">Dribbble</div>
+            <div class="bm-desc">设计师作品展示</div>
+          </a>
+          <a class="bookmark-card" href="https://www.figma.com" target="_blank" rel="noopener">
+            <div class="bm-icon">✏️</div>
+            <div class="bm-name">Figma</div>
+            <div class="bm-desc">协作式设计工具</div>
+          </a>
+          <a class="bookmark-card" href="https://coolors.co" target="_blank" rel="noopener">
+            <div class="bm-icon">🎨</div>
+            <div class="bm-name">Coolors</div>
+            <div class="bm-desc">配色方案生成</div>
+          </a>
+          <a class="bookmark-card" href="https://fonts.google.com" target="_blank" rel="noopener">
+            <div class="bm-icon">🔤</div>
+            <div class="bm-name">Google Fonts</div>
+            <div class="bm-desc">免费网页字体</div>
+          </a>
+          <a class="bookmark-card" href="https://www.awwwards.com" target="_blank" rel="noopener">
+            <div class="bm-icon">🏆</div>
+            <div class="bm-name">Awwwards</div>
+            <div class="bm-desc">优秀网页设计奖</div>
+          </a>
+        </div>
+      </div>
+
+      <div class="category">
+        <h3>🤖 AI & 效率</h3>
+        <div class="bookmark-grid">
+          <a class="bookmark-card" href="https://chat.openai.com" target="_blank" rel="noopener">
+            <div class="bm-icon">💬</div>
+            <div class="bm-name">ChatGPT</div>
+            <div class="bm-desc">OpenAI 对话模型</div>
+          </a>
+          <a class="bookmark-card" href="https://claude.ai" target="_blank" rel="noopener">
+            <div class="bm-icon">🧠</div>
+            <div class="bm-name">Claude</div>
+            <div class="bm-desc">Anthropic AI 助手</div>
+          </a>
+          <a class="bookmark-card" href="https://grok.x.ai" target="_blank" rel="noopener">
+            <div class="bm-icon">⚡</div>
+            <div class="bm-name">Grok</div>
+            <div class="bm-desc">xAI 智能助手</div>
+          </a>
+          <a class="bookmark-card" href="https://www.notion.so" target="_blank" rel="noopener">
+            <div class="bm-icon">📝</div>
+            <div class="bm-name">Notion</div>
+            <div class="bm-desc">全能笔记与协作</div>
+          </a>
+          <a class="bookmark-card" href="https://excalidraw.com" target="_blank" rel="noopener">
+            <div class="bm-icon">📐</div>
+            <div class="bm-name">Excalidraw</div>
+            <div class="bm-desc">手绘风格白板</div>
+          </a>
+        </div>
+      </div>
+
+      <div class="category">
+        <h3>📖 学习资源</h3>
+        <div class="bookmark-grid">
+          <a class="bookmark-card" href="https://developer.mozilla.org" target="_blank" rel="noopener">
+            <div class="bm-icon">📖</div>
+            <div class="bm-name">MDN Web Docs</div>
+            <div class="bm-desc">Web 技术权威文档</div>
+          </a>
+          <a class="bookmark-card" href="https://css-tricks.com" target="_blank" rel="noopener">
+            <div class="bm-icon">🎯</div>
+            <div class="bm-name">CSS-Tricks</div>
+            <div class="bm-desc">CSS 技巧与教程</div>
+          </a>
+          <a class="bookmark-card" href="https://javascript.info" target="_blank" rel="noopener">
+            <div class="bm-icon">🟨</div>
+            <div class="bm-name">JavaScript.info</div>
+            <div class="bm-desc">现代 JS 教程</div>
+          </a>
+          <a class="bookmark-card" href="https://web.dev" target="_blank" rel="noopener">
+            <div class="bm-icon">🌐</div>
+            <div class="bm-name">web.dev</div>
+            <div class="bm-desc">Google Web 指南</div>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section id="about" style="text-align:center; padding: 40px 0; color: var(--muted);">
+      <p>混淆在浏览器端运行，不会上传任何数据。</p>
+      <p style="margin-top:8px; font-size:0.85rem;">混淆引擎：javascript-obfuscator（CDN 优先，失败回退服务端本地文件）</p>
+    </section>
+  </main>
+
+  <footer>
+    <p>DevTools · 仅供学习交流</p>
+  </footer>
+
+  <div class="toast" id="toast">已复制到剪贴板</div>
+
+<script>
+  // 检查混淆引擎是否加载成功（CDN 优先，失败时已回退本地文件）
+  window.addEventListener('DOMContentLoaded', () => {
+    const status = document.getElementById('statusBar');
+    if (typeof JavaScriptObfuscator === 'undefined') {
+      status.className = 'status-bar error';
+      status.textContent = '❌ 混淆引擎加载失败，请检查网络后刷新重试';
+    } else {
+      status.className = 'status-bar ok';
+      status.textContent = '✅ 专业混淆引擎已就绪';
+    }
+  });
+
+  // ========== UUID ==========
+  function uuidv4() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  function generateUUIDs(count = 1) {
+    const list = document.getElementById('uuidList');
+    if (list.children.length === 1 && list.querySelector('#firstUuid')) {
+      list.innerHTML = '';
+    }
+    for (let i = 0; i < count; i++) {
+      const id = uuidv4();
+      const item = document.createElement('div');
+      item.className = 'uuid-item';
+      item.innerHTML = `
+        <code>${id}</code>
+        <button class="copy-btn" onclick="copyText(this, '${id}')">复制</button>
+      `;
+      list.prepend(item);
+    }
+  }
+
+  function clearUUIDs() {
+    document.getElementById('uuidList').innerHTML = `
+      <div class="uuid-item">
+        <code id="firstUuid">点击上方按钮生成</code>
+        <button class="copy-btn" onclick="copyText(this, document.getElementById('firstUuid').textContent)">复制</button>
+      </div>`;
+  }
+
+  // ========== 专业混淆 ==========
+  const presets = {
+    low: {
+      compact: true,
+      controlFlowFlattening: false,
+      deadCodeInjection: false,
+      stringArray: true,
+      stringArrayEncoding: [],
+      selfDefending: false,
+      renameGlobals: false,
+      numbersToExpressions: false,
+      simplify: true,
+      splitStrings: false
+    },
+    medium: {
+      compact: true,
+      controlFlowFlattening: true,
+      controlFlowFlatteningThreshold: 0.5,
+      deadCodeInjection: true,
+      deadCodeInjectionThreshold: 0.3,
+      stringArray: true,
+      stringArrayEncoding: ['base64'],
+      stringArrayThreshold: 0.75,
+      selfDefending: false,
+      renameGlobals: false,
+      numbersToExpressions: true,
+      simplify: true,
+      splitStrings: true,
+      splitStringsChunkLength: 5
+    },
+    high: {
+      compact: true,
+      controlFlowFlattening: true,
+      controlFlowFlatteningThreshold: 0.75,
+      deadCodeInjection: true,
+      deadCodeInjectionThreshold: 0.4,
+      stringArray: true,
+      stringArrayEncoding: ['rc4'],
+      stringArrayThreshold: 0.8,
+      selfDefending: true,
+      renameGlobals: false,
+      numbersToExpressions: true,
+      simplify: true,
+      splitStrings: true,
+      splitStringsChunkLength: 3,
+      transformObjectKeys: true,
+      unicodeEscapeSequence: false
+    }
+  };
+
+  let currentPreset = 'low';
+
+  function setPreset(name) {
+    currentPreset = name;
+    document.querySelectorAll('.btn-preset').forEach(b => b.classList.remove('active'));
+    document.querySelector(`[data-preset="${name}"]`).classList.add('active');
+
+    const p = presets[name];
+    document.getElementById('optCompact').checked = !!p.compact;
+    document.getElementById('optControlFlow').checked = !!p.controlFlowFlattening;
+    document.getElementById('optDeadCode').checked = !!p.deadCodeInjection;
+    document.getElementById('optStringArray').checked = !!p.stringArray;
+    document.getElementById('optStringEncode').checked = Array.isArray(p.stringArrayEncoding) && p.stringArrayEncoding.length > 0;
+    document.getElementById('optSelfDefending').checked = !!p.selfDefending;
+    document.getElementById('optRenameGlobals').checked = !!p.renameGlobals;
+    document.getElementById('optNumbersToExpr').checked = !!p.numbersToExpressions;
+  }
+
+  function buildOptions() {
+    const base = { ...presets[currentPreset] };
+    base.compact = document.getElementById('optCompact').checked;
+    base.controlFlowFlattening = document.getElementById('optControlFlow').checked;
+    base.deadCodeInjection = document.getElementById('optDeadCode').checked;
+    base.stringArray = document.getElementById('optStringArray').checked;
+    base.selfDefending = document.getElementById('optSelfDefending').checked;
+    base.renameGlobals = document.getElementById('optRenameGlobals').checked;
+    base.numbersToExpressions = document.getElementById('optNumbersToExpr').checked;
+
+    if (document.getElementById('optStringEncode').checked) {
+      base.stringArrayEncoding = currentPreset === 'high' ? ['rc4'] : ['base64'];
+    } else {
+      base.stringArrayEncoding = [];
+    }
+
+    base.target = 'browser';
+    return base;
+  }
+
+  function runObfuscate() {
+    if (typeof JavaScriptObfuscator === 'undefined') {
+      showToast('混淆引擎未加载，请检查网络后刷新重试');
+      return;
+    }
+    const code = document.getElementById('jsInput').value;
+    if (!code.trim()) {
+      showToast('请先输入代码');
+      return;
+    }
+
+    const status = document.getElementById('statusBar');
+    status.className = 'status-bar';
+    status.textContent = '正在混淆，请稍候...';
+
+    setTimeout(() => {
+      try {
+        const options = buildOptions();
+        const result = JavaScriptObfuscator.obfuscate(code, options);
+        const obfuscated = result.getObfuscatedCode();
+        document.getElementById('jsOutput').value = obfuscated;
+
+        const ratio = ((obfuscated.length / code.length) * 100).toFixed(1);
+        document.getElementById('obfStats').innerHTML =
+          `原始 <span>${code.length}</span> 字符 → 混淆后 <span>${obfuscated.length}</span> 字符（${ratio}%）`;
+
+        status.className = 'status-bar ok';
+        status.textContent = '✅ 混淆完成';
+        showToast('专业混淆完成');
+      } catch (err) {
+        status.className = 'status-bar error';
+        status.textContent = '❌ 混淆失败：' + (err.message || err);
+        console.error(err);
+      }
+    }, 30);
+  }
+
+  function copyObfuscated() {
+    const text = document.getElementById('jsOutput').value;
+    if (!text) {
+      showToast('没有可复制的内容');
+      return;
+    }
+    navigator.clipboard.writeText(text).then(() => showToast('已复制混淆结果'));
+  }
+
+  // ========== 通用 ==========
+  function copyText(btn, text) {
+    if (!text || text === '点击上方按钮生成') return;
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = '已复制';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = '复制';
+        btn.classList.remove('copied');
+      }, 1500);
+      showToast('UUID 已复制');
+    });
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 2200);
+  }
+
+  // ========== 粒子背景 ==========
+  const canvas = document.getElementById('particles');
+  const ctx = canvas.getContext('2d');
+  let particles = [];
+  let w, h;
+
+  function resize() {
+    w = canvas.width = window.innerWidth;
+    h = canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  class Particle {
+    constructor() { this.reset(); }
+    reset() {
+      this.x = Math.random() * w;
+      this.y = Math.random() * h;
+      this.size = Math.random() * 1.8 + 0.4;
+      this.speedX = (Math.random() - 0.5) * 0.4;
+      this.speedY = (Math.random() - 0.5) * 0.4;
+      this.opacity = Math.random() * 0.4 + 0.1;
+    }
+    update() {
+      this.x += this.speedX;
+      this.y += this.speedY;
+      if (this.x < 0 || this.x > w || this.y < 0 || this.y > h) this.reset();
+    }
+    draw() {
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(124, 92, 255, ${this.opacity})`;
+      ctx.fill();
+    }
+  }
+
+  for (let i = 0; i < 60; i++) particles.push(new Particle());
+
+  function animate() {
+    ctx.clearRect(0, 0, w, h);
+    particles.forEach(p => { p.update(); p.draw(); });
+    for (let i = 0; i < particles.length; i++) {
+      for (let j = i + 1; j < particles.length; j++) {
+        const dx = particles[i].x - particles[j].x;
+        const dy = particles[i].y - particles[j].y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 120) {
+          ctx.beginPath();
+          ctx.strokeStyle = `rgba(124, 92, 255, ${0.12 * (1 - dist / 120)})`;
+          ctx.lineWidth = 0.6;
+          ctx.moveTo(particles[i].x, particles[i].y);
+          ctx.lineTo(particles[j].x, particles[j].y);
+          ctx.stroke();
+        }
+      }
+    }
+    requestAnimationFrame(animate);
+  }
+  animate();
+
+  // 初始化
+  setPreset('low');
+  generateUUIDs(1);
+</script>
+</body>
+</html>

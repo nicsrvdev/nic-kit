@@ -1,0 +1,113 @@
+name: Release nic binaries
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "gosrc/**"
+      - "index.js"
+      - "package.json"
+      - "test/**"
+      - ".github/workflows/release-nic.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-nic
+  cancel-in-progress: false
+
+jobs:
+  js-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run JS tests
+        run: npm test
+
+  build:
+    needs: js-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Resolve tags from index.js FALLBACK
+        id: tags
+        run: |
+          NICCORE_TAG=$(sed -n 's/.*niccore: "\(.*\)".*/\1/p' index.js | head -1)
+          NICLINK_TAG=$(sed -n 's/.*niclink: "\(.*\)".*/\1/p' index.js | head -1)
+          if [ -z "$NICCORE_TAG" ] || [ -z "$NICLINK_TAG" ]; then
+            echo "failed to parse FALLBACK tags from index.js" >&2
+            exit 1
+          fi
+          echo "niccore_tag=${NICCORE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "niclink_tag=${NICLINK_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tags: ${NICCORE_TAG} / ${NICLINK_TAG}"
+
+      - name: Build amd64
+        working-directory: gosrc
+        env:
+          NICLINK_TAG: ${{ steps.tags.outputs.niclink_tag }}
+        run: |
+          CGO_ENABLED=0 go build -tags with_quic -trimpath -ldflags "-s -w" -o niccore-linux-amd64 ./niccore
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${NICLINK_TAG}" -o niclink-linux-amd64 ./niclink
+
+      - name: Build arm64
+        working-directory: gosrc
+        env:
+          NICLINK_TAG: ${{ steps.tags.outputs.niclink_tag }}
+        run: |
+          CGO_ENABLED=0 GOARCH=arm64 go build -tags with_quic -trimpath -ldflags "-s -w" -o niccore-linux-arm64 ./niccore
+          CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.Version=${NICLINK_TAG}" -o niclink-linux-arm64 ./niclink
+
+      - uses: docker/setup-qemu-action@v3
+      - name: Smoke check amd64
+        working-directory: gosrc
+        run: |
+          ./niccore-linux-amd64 run --help 2>&1 | head -3
+          ./niclink-linux-amd64 run --help 2>&1 | head -3
+
+      - name: Rename with tag
+        working-directory: gosrc
+        env:
+          NICCORE_TAG: ${{ steps.tags.outputs.niccore_tag }}
+          NICLINK_TAG: ${{ steps.tags.outputs.niclink_tag }}
+        run: |
+          mv niccore-linux-amd64 "niccore-${NICCORE_TAG}-linux-amd64"
+          mv niccore-linux-arm64 "niccore-${NICCORE_TAG}-linux-arm64"
+          mv niclink-linux-amd64 "niclink-${NICLINK_TAG}-linux-amd64"
+          mv niclink-linux-arm64 "niclink-${NICLINK_TAG}-linux-arm64"
+
+      - name: Move tags to HEAD
+        env:
+          NICCORE_TAG: ${{ steps.tags.outputs.niccore_tag }}
+          NICLINK_TAG: ${{ steps.tags.outputs.niclink_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f "${NICCORE_TAG}" HEAD
+          git tag -f "${NICLINK_TAG}" HEAD
+          git push origin "${NICCORE_TAG}" "${NICLINK_TAG}" --force
+
+      - name: Publish niccore release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.niccore_tag }}
+          files: |
+            gosrc/niccore-${{ steps.tags.outputs.niccore_tag }}-linux-*
+
+      - name: Publish niclink release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.niclink_tag }}
+          files: |
+            gosrc/niclink-${{ steps.tags.outputs.niclink_tag }}-linux-*
