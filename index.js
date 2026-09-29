@@ -1012,33 +1012,22 @@ function watchLinkOutput(child, onDomain) {
   return () => found;
 }
 
-/** 拨测 temp 域名是否存活：HTTPS GET / 根路径，可达即活（404/503 都是 edge 通了；超时/5xx 网关类算死） */
+/** 拨测 temp 域名是否存活：纯 HTTPS GET /（可达即活；502/503=隧道真死；超时/网络异常算死）。
+ * 注意：fetch 不允许手拼 Upgrade 头（undici 直接抛 invalid upgrade header），
+ * 所以这里只能是普通 GET——它验证的是 edge 可达 + 源站有响应，足够做存活判断。 */
 async function probeTempDomain(domain, cfg, timeoutMs = 15000) {
   const host = String(domain || "").replace(/^https?:\/\//, "").replace(/\/+$/, "");
   if (!host) return { ok: false, reason: "empty" };
-  // WS 握手拨测：走链路入站的 ws 路径（默认 /link），通则 edge→源站全链路正常；
-  // niccore 只认配置路径，握手成功回 101，不再产生 bad path 日志
-  const wsPath = (cfg && cfg.wsPath) || "/link";
   try {
-    const key = randomBytes(16).toString("base64");
-    const res = await fetch(`https://${host}${wsPath}`, {
+    const res = await fetch(`https://${host}/`, {
       method: "GET",
-      headers: {
-        "User-Agent": "nic-kit-domaincheck",
-        Connection: "Upgrade",
-        Upgrade: "websocket",
-        "Sec-WebSocket-Version": "13",
-        "Sec-WebSocket-Key": key,
-      },
+      headers: { "User-Agent": "nic-kit-domaincheck" },
       signal: AbortSignal.timeout(timeoutMs),
     });
-    // 101 = 全链路通；502/503 = 源站或链路真死；530/429（edge 限流）判活，
-    // 否则限流时段 niclink 会被反复杀（本地实测 restart 死循环）。
+    // 502 = 源站（niccore）无响应；503 = edge 上隧道已注销/不可用；
+    // 530/429（edge 限流）判活，否则限流时段 niclink 会被反复杀（本地实测 restart 死循环）。
     if (res.status === 502 || res.status === 503) {
       return { ok: false, reason: `http=${res.status}` };
-    }
-    if (res.status === 530 || res.status === 429) {
-      return { ok: true, reason: `http=${res.status}-limited` };
     }
     return { ok: true, reason: `http=${res.status}` };
   } catch (e) {
@@ -1395,12 +1384,21 @@ async function diskIo() {
     const cols = line.trim().split(/\s+/);
     if (cols.length < 14) continue;
     const name = cols[2] || "";
-    if (/^(loop|ram|dm-\d+|sr\d+)/.test(name)) continue;
-    if (/[0-9]$/.test(name)) continue; // 只算整盘，跳过分区
+    if (!isWholeDisk(name)) continue;
     r += (Number(cols[5]) || 0) * 512;
     w += (Number(cols[9]) || 0) * 512;
   }
   return { readBytes: r, writeBytes: w };
+}
+
+// 整盘判定：nvme0n1/mmcblk0 以数字结尾但是整盘（分区是 nvme0n1p1/mmcblk0p1）；
+// sda1/vda1 这类以数字结尾的才是分区
+function isWholeDisk(name) {
+  if (/^(loop|ram|dm-\d+|sr\d+)/.test(name)) return false;
+  if (/^nvme\d+n\d+$/.test(name)) return true;
+  if (/^mmcblk\d+$/.test(name)) return true;
+  if (/[0-9]$/.test(name)) return false;
+  return true;
 }
 
 function splitHostPort(hostport, defPort) {
@@ -1649,7 +1647,6 @@ function wsConnect(rawWsUrl, extraHeaders, timeoutMs) {
 // - never throws out; reports status via getStatus()
 const AGENT_VERSION = "nic-kit-cfprobe/0.2.0";
 const CONFIG_SCHEMA = "7";
-const WSS_REPORT_DEFAULT_MS = 2000;
 const WSS_REPORT_MIN_MS = 1000;
 const WSS_REPORT_MAX_MS = 5 * 60 * 1000;
 const WSS_PAUSE_MS = 120 * 1000;
@@ -1673,6 +1670,7 @@ function createCfProbe(cfg) {
     // custom_ct,custom_cu,custom_cm,custom_bd/node_1..4/interface/connection_mode/ping_mode
     dynCollectInterval: 0,   // 有效采样间隔（auto 模式归一到 wss 间隔，见 effCollectInterval）
     dynReportInterval: 0,    // 有效上报间隔（0=用本地 CF_INTERVAL）
+    dynWssReportInterval: 2, // 面板下发的 wss 上报间隔（秒）；wssIntervalMs 的基准，可被 ack 覆盖
     dynResetDay: 1,
     dynCt: "", dynCu: "", dynCm: "", dynBgp: "",
     dynNode1: "", dynNode2: "", dynNode3: "", dynNode4: "",
@@ -1702,6 +1700,7 @@ function createCfProbe(cfg) {
     wssBackoffMs: WSS_NET_MIN_MS,
     wssReportAfterMs: 0, // 服务端 ack 下发的下次上报间隔（0=用默认 2s）
     wssLoop: null,
+    wssTickLoop: null,
     wssLastConfigAt: 0,
     wssWantStop: false,
   };
@@ -1918,8 +1917,9 @@ function createCfProbe(cfg) {
     const values = [];
     let lost = 0, total = 0;
     for (const s of h.slice(-6)) {
+      if (s.at < cutoff) continue; // 过期采样直接出窗口：不计入 total，否则会稀释 loss
       total++;
-      if (!s.ok || s.rtt < 0 || s.at < cutoff) { if (!s.ok) lost++; continue; }
+      if (!s.ok || s.rtt < 0) { if (!s.ok) lost++; continue; }
       values.push(s.rtt);
     }
     const loss = total ? Math.floor(lost * 100 / total) : 100;
@@ -2081,12 +2081,14 @@ function createCfProbe(cfg) {
     const report = pint("report_interval", -1);
     const wssReport = pint("wss_report_interval", 2);
     const reset = pint("reset_day", -1);
-    if (![0, 1, 2, 5, 10].includes(collect)) return { ok: false, reason: `invalid collect_interval ${collect}` };
-    if (![30, 60, 120, 180].includes(report)) return { ok: false, reason: `invalid report_interval ${report}` };
+    // 字段缺席时不校验（pint 返回 -1 表示缺席，消费者会回退到本地值）；只校验下发了但写错的情况
+    if ("collect_interval" in values && ![0, 1, 2, 5, 10].includes(collect)) return { ok: false, reason: `invalid collect_interval ${collect}` };
+    if ("report_interval" in values && ![30, 60, 120, 180].includes(report)) return { ok: false, reason: `invalid report_interval ${report}` };
     if (wssReport < 1 || wssReport > 5) return { ok: false, reason: `invalid wss_report_interval ${wssReport}` };
-    if (reset < 0 || reset > 31) return { ok: false, reason: `invalid reset_day ${reset}` };
-    if (values.schema_version !== CONFIG_SCHEMA) return { ok: false, reason: `invalid schema_version ${values.schema_version}` };
-    if (report < collect) return { ok: false, reason: "report_interval less than collect_interval" };
+    if ("reset_day" in values && (reset < 0 || reset > 31)) return { ok: false, reason: `invalid reset_day ${reset}` };
+    // schema_version 缺席时不卡（只校验下发了但写错的情况），避免面板只推部分字段时整个配置被拒
+    if ("schema_version" in values && values.schema_version !== CONFIG_SCHEMA) return { ok: false, reason: `invalid schema_version ${values.schema_version}` };
+    if ("report_interval" in values && "collect_interval" in values && report < collect) return { ok: false, reason: "report_interval less than collect_interval" };
     const connMode = String(values.connection_mode ?? "").toLowerCase();
     if (connMode && connMode !== "auto" && connMode !== "http") return { ok: false, reason: `invalid connection_mode ${values.connection_mode}` };
     const pingMode = String(values.ping_mode ?? "").toLowerCase();
@@ -2096,6 +2098,7 @@ function createCfProbe(cfg) {
     if ((connMode || effConnectionMode()) === "auto" && (collect <= 0 || collect > wssReport)) effCollect = wssReport;
     const changed = hasMd5 ? hex !== state.configMd5
       : (effCollect !== state.dynCollectInterval || report !== (state.dynReportInterval || effReportInterval())
+        || wssReport !== state.dynWssReportInterval
         || reset !== state.dynResetDay || (values.custom_ct ?? "") !== state.dynCt
         || (values.custom_cu ?? "") !== state.dynCu || (values.custom_cm ?? "") !== state.dynCm
         || (values.custom_bd ?? "") !== state.dynBgp || (values.node_1 ?? "") !== state.dynNode1
@@ -2105,6 +2108,7 @@ function createCfProbe(cfg) {
     if (!changed) return { ok: true, noop: true };
     state.dynCollectInterval = effCollect;
     state.dynReportInterval = report;
+    state.dynWssReportInterval = wssReport;
     state.dynResetDay = reset;
     state.dynCt = values.custom_ct ?? "";
     state.dynCu = values.custom_cu ?? "";
@@ -2123,6 +2127,9 @@ function createCfProbe(cfg) {
     state.samples = [];
     state.lastSampleAt = 0;
     state.wssReportAfterMs = 0;
+    // connection_mode 动态切换：http→auto 拉起 WSS 双循环；auto→http 断开现有连接（循环自行退出）
+    if (useWss()) ensureWssLoops();
+    else closeWs();
     logger.status(`cfprobe ok: dynamic config applied md5=${hasMd5 ? hex : "(none)"} conn=${connMode || effConnectionMode()} ping=${pingMode || effPingMode()}`);
     return { ok: true };
   }
@@ -2138,13 +2145,24 @@ function createCfProbe(cfg) {
     if (!bodyText) return;
     const raw = String(bodyText).trim();
     if (!raw || raw === "{}" || /^OK$/i.test(raw)) return;
-    // 动态配置：query-string body + 服务端 X-Agent-Config-Md5 头（对齐官方）
-    if (/collect_interval|report_interval|schema_version/.test(raw)) {
+    // 动态配置：query-string body + 服务端 X-Agent-Config-Md5 头（对齐官方）；
+    // 只要 body 里出现任一已知配置字段就尝试解析（之前只认 collect/report/schema 三个关键词，
+    // 面板只推 connection_mode/ping_mode 等会被静默丢掉）
+    if (bodyHasConfigField(raw)) {
       let md5 = "";
       try { md5 = String(res.headers.get("x-agent-config-md5") || ""); } catch {}
       const r = applyDynConfig(raw, md5);
       if (!r.ok && !r.noop) logger.warn(`cfprobe dynamic config rejected: ${r.reason}`);
     }
+  }
+
+  // body 里是否出现任一已知动态配置字段（query-string key 形态）
+  function bodyHasConfigField(raw) {
+    for (const seg of String(raw).split("&")) {
+      const k = seg.split("=", 1)[0];
+      if (DYN_ALLOWED.has(k)) return true;
+    }
+    return false;
   }
 
   function postUrl() {
@@ -2177,10 +2195,12 @@ function createCfProbe(cfg) {
   }
 
   function wssIntervalMs() {
+    // 优先级：服务端 ack 下发的 nextWssReportAfterMs > 面板配置 wss_report_interval > 默认 2s
     if (state.wssReportAfterMs > 0) {
       return Math.min(Math.max(state.wssReportAfterMs, WSS_REPORT_MIN_MS), WSS_REPORT_MAX_MS);
     }
-    return WSS_REPORT_DEFAULT_MS;
+    const base = (state.dynWssReportInterval > 0 ? state.dynWssReportInterval : 2) * 1000;
+    return Math.min(Math.max(base, WSS_REPORT_MIN_MS), WSS_REPORT_MAX_MS);
   }
 
   function closeWs() {
@@ -2555,9 +2575,9 @@ function createCfProbe(cfg) {
       return true;
     } catch (e) {
       closeWs();
-      // 写失败立即尝试一次 POST fallback（对齐官方）
+      // 写失败立即尝试一次 POST fallback（对齐官方）；sendViaWss 已采样过，这里不再重复推
       logger.debug(`WSS write failed, POST fallback once: ${e.message}`);
-      return await postOnce(true);
+      return await postOnce(true, true);
     }
   }
 
@@ -2657,19 +2677,30 @@ function createCfProbe(cfg) {
   }
 
   async function wssTickLoop() {
-    // WSS 节奏发送循环：按服务端下发的间隔（默认 2s）发送；断连则停等重连
-    while (state.running && useWss() && !state.wssWantStop) {
-      if (!state.wssConnected || !state.ws) {
-        await new Promise((r) => setTimeout(r, 1000));
-        continue;
+    // WSS 节奏发送循环：按服务端下发的间隔发送；断连则停等重连
+    if (state.wssTickLoop) return;
+    state.wssTickLoop = (async () => {
+      while (state.running && useWss() && !state.wssWantStop) {
+        if (!state.wssConnected || !state.ws) {
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        const ok = await sendViaWss();
+        if (!ok) {
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+        await new Promise((r) => setTimeout(r, wssIntervalMs()));
       }
-      const ok = await sendViaWss();
-      if (!ok) {
-        await new Promise((r) => setTimeout(r, 2000));
-        continue;
-      }
-      await new Promise((r) => setTimeout(r, wssIntervalMs()));
-    }
+      state.wssTickLoop = null;
+    })();
+  }
+
+  /** 按当前 connection_mode 确保 WSS 双循环在跑（幂等；动态切回 auto 时拉起） */
+  function ensureWssLoops() {
+    if (!state.running || state.wssWantStop || !useWss()) return;
+    wssEnsureLoop();
+    wssTickLoop();
   }
 
   return {
@@ -2678,13 +2709,7 @@ function createCfProbe(cfg) {
       state.running = true;
       state.wssWantStop = false;
       logger.status(`cfprobe ok: started mode=${effConnectionMode()} every ${effReportInterval()}s ping=${effPingMode()}`);
-      if (useWss()) {
-        wssEnsureLoop();
-        (async () => {
-          // WSS 节奏发送与 POST 兜底 tick 并行
-          wssTickLoop();
-        })();
-      }
+      ensureWssLoops();
       // 后台采样：测速 20s + 公网 IP 10min（对齐官方 networkWorker）
       probeTick();
       ipTick();
@@ -2753,12 +2778,16 @@ const RESTART_RESET_MS = 10 * 60 * 1000; // 连续健康运行超过 10 分钟�
 
 class Runner {
   constructor() {
-    this.children = new Map(); // name -> ChildProcess
-    this.stopping = false;
-    this.timers = new Map(); // name -> timeout
-    this.restarts = new Map(); // name -> count
-    this.spawnedAt = new Map(); // name -> 上次 spawn 成功的时间戳
+    this.children = new Map();   // name -> ChildProcess（正在运行）
+    this.timers = new Map();     // name -> 待触发的重启 timer
+    this.restarts = new Map();   // name -> 连续非预期退出计数
+    this.spawnedAt = new Map();  // name -> 上次 spawn 时间戳
+    this.lastSpawn = new Map();  // name -> { bin, args, opts }（restart/意外退出复用）
+    this.wantRunning = new Set();// 明确意图：这些进程"应该活着"，只有它们配自动重启
     this.refetchers = new Map(); // name -> async () => binPath | null（TTL 删二进制后重下用）
+    this.spawnHooks = new Map(); // name -> [fn]
+    this.giveUpHooks = new Map();// name -> [fn]
+    this.stopping = false;
   }
 
   /** 注册缺二进制时的重下函数（ensure* 包装）。不注册则保持原行为。 */
@@ -2768,14 +2797,73 @@ class Runner {
 
   /** 注册进程每次 spawn 成功后的钩子（onSpawn(name, child)）；用于 niclink 重启后重绑日志监听 */
   onSpawn(name, fn) {
-    this.spawnHooks = this.spawnHooks || new Map();
-    const arr = this.spawnHooks.get(name) || [];
-    arr.push(fn);
-    this.spawnHooks.set(name, arr);
+    pushHook(this.spawnHooks, name, fn);
   }
 
+  /** 注册进程达到最大重启次数放弃后的钩子（onGiveUp(name)） */
+  onGiveUp(name, fn) {
+    pushHook(this.giveUpHooks, name, fn);
+  }
+
+  /** 对外启动：标记"应该活着"并拉起；已在跑的先杀掉（不触发重启，由本调用接管） */
   start(name, bin, args, opts = {}) {
-    this.stop(name, true);
+    this.lastSpawn.set(name, { bin, args, opts });
+    this.wantRunning.add(name);
+    this._clearTimer(name);
+    this._kill(name, true);
+    return this._spawn(name, bin, args, opts);
+  }
+
+  /** 对外停止：明确"不该活着"——随后到来的 exit 一律视为 stale，不触发重启 */
+  stop(name, silent = false) {
+    this.wantRunning.delete(name);
+    this._clearTimer(name);
+    this._kill(name, silent);
+  }
+
+  /** 对外重启：保持"应该活着"，杀旧进程并按退避显式重排一次（不依赖 exit 事件） */
+  restart(name, reason) {
+    const s = this.lastSpawn.get(name);
+    if (!s) {
+      logger.warn(`${name} restart: no spawn info, skipped`);
+      return false;
+    }
+    this.wantRunning.add(name);
+    this._clearTimer(name);
+    this._kill(name, true);
+    this.scheduleRestart(name, s.bin, s.args, s.opts, reason || "manual restart");
+    return true;
+  }
+
+  stopAll() {
+    this.stopping = true;
+    for (const name of [...this.children.keys()]) this.stop(name);
+    this.wantRunning.clear();
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
+  }
+
+  _clearTimer(name) {
+    const t = this.timers.get(name);
+    if (t) {
+      clearTimeout(t);
+      this.timers.delete(name);
+    }
+  }
+
+  /** 只杀进程删表，不碰 wantRunning/timer——调用方自己决定意图 */
+  _kill(name, silent) {
+    const child = this.children.get(name);
+    this.children.delete(name); // 先删表：随后到来的 exit 一律判 stale
+    if (child && !child.killed) {
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+      if (!silent) logger.info(`stopped ${name}`);
+    }
+  }
+
+  _spawn(name, bin, args, opts) {
     logger.status(`${name} starting`);
     // niccore 日志量大且已脱敏过滤：pipe 接住只为错误上浮，不缓存
     const child = spawn(bin, args, {
@@ -2799,29 +2887,41 @@ class Runner {
     this.children.set(name, child);
     this.spawnedAt.set(name, Date.now());
     // spawn 钩子：每次（含重启）都触发，调用方自行挂监听
-    try {
-      const hooks = (this.spawnHooks && this.spawnHooks.get(name)) || [];
-      for (const fn of hooks) fn(child);
-    } catch (e) {
-      logger.warn(`${name} spawn hook error: ${e.message}`);
-    }
-    child.on("exit", (code, signal) => {
-      this.children.delete(name);
-      if (this.stopping) return;
-      logger.status(`${name} exited code=${code} signal=${signal}`);
-      this.scheduleRestart(name, bin, args, opts, `exited code=${code} signal=${signal}`);
-    });
-    child.on("error", (e) => {
-      // ENOENT = 二进制被 TTL 删了（或从未下载成功）：先重下再重启，而不是空转 30 次
-      if (e.code === "ENOENT" || /ENOENT/.test(e.message || "")) {
-        logger.warn(`${name} binary missing (${bin}), refetching...`);
-        this.refetch(name, args, opts);
-        return;
+    for (const fn of this.spawnHooks.get(name) || []) {
+      try {
+        fn(child);
+      } catch (e) {
+        logger.warn(`${name} spawn hook error: ${e.message}`);
       }
-      logger.error(`${name} spawn error: ${e.message}`);
-      this.scheduleRestart(name, bin, args, opts, `spawn error: ${e.message}`);
-    });
+    }
+    child.on("exit", (code, signal) => this._onExit(name, child, code, signal));
+    child.on("error", (e) => this._onError(name, child, bin, args, opts, e));
     return child;
+  }
+
+  /** 进程退出的唯一决策点：stale（被 stop/restart/replace 过）直接忽略；
+   *  只有"应该活着"又意外死了的，才按退避重启。 */
+  _onExit(name, child, code, signal) {
+    if (this.children.get(name) !== child) return; // stale
+    this.children.delete(name);
+    if (this.stopping || !this.wantRunning.has(name)) return; // 主动停的 → 保持死亡
+    logger.status(`${name} exited code=${code} signal=${signal}`);
+    const s = this.lastSpawn.get(name);
+    if (s) this.scheduleRestart(name, s.bin, s.args, s.opts, `exited code=${code} signal=${signal}`);
+  }
+
+  /** spawn 失败（error 后必有 exit）：这里决策，exit 到时判 stale，避免一次失败安排两次重启 */
+  _onError(name, child, bin, args, opts, e) {
+    if (this.children.get(name) === child) this.children.delete(name);
+    if (this.stopping || !this.wantRunning.has(name)) return;
+    // ENOENT = 二进制被 TTL 删了（或从未下载成功）：先重下再重启，而不是空转 30 次
+    if (e.code === "ENOENT" || /ENOENT/.test(e.message || "")) {
+      logger.warn(`${name} binary missing (${bin}), refetching...`);
+      this.refetch(name, args, opts);
+      return;
+    }
+    logger.error(`${name} spawn error: ${e.message}`);
+    this.scheduleRestart(name, bin, args, opts, `spawn error: ${e.message}`);
   }
 
   scheduleRestart(name, bin, args, opts, reason) {
@@ -2835,11 +2935,19 @@ class Runner {
     this.restarts.set(name, n);
     if (n > MAX_RESTARTS) {
       logger.status(`${name} failed: max restarts (${MAX_RESTARTS}) reached, giving up (${reason})`);
+      for (const fn of this.giveUpHooks.get(name) || []) {
+        try {
+          fn();
+        } catch (e) {
+          logger.warn(`${name} giveup hook error: ${e.message}`);
+        }
+      }
       return;
     }
     // 指数退避：5s, 10s, 20s ... 上限 60s
     const delay = Math.min(RESTART_BASE_MS * Math.pow(2, Math.min(n - 1, 4)), 60000);
     logger.status(`${name} restart #${n} in ${delay / 1000}s (${reason})`);
+    this._clearTimer(name);
     const t = setTimeout(() => {
       if (!this.stopping) this.start(name, bin, args, opts);
     }, delay);
@@ -2861,6 +2969,7 @@ class Runner {
       this.restarts.set(name, 0);
       logger.status(`${name} ok: binary refetched`);
       if (!this.stopping) {
+        this._clearTimer(name);
         const t = setTimeout(() => {
           if (!this.stopping) this.start(name, freshBin, args, opts);
         }, 3000);
@@ -2869,29 +2978,6 @@ class Runner {
     } catch (e) {
       this.scheduleRestart(name, "", args, opts, `refetch failed: ${e.message}`);
     }
-  }
-
-  stop(name, silent = false) {
-    const t = this.timers.get(name);
-    if (t) {
-      clearTimeout(t);
-      this.timers.delete(name);
-    }
-    const child = this.children.get(name);
-    if (child && !child.killed) {
-      try {
-        child.kill("SIGTERM");
-      } catch {}
-      if (!silent) logger.info(`stopped ${name}`);
-    }
-    this.children.delete(name);
-  }
-
-  stopAll() {
-    this.stopping = true;
-    for (const name of [...this.children.keys()]) this.stop(name);
-    for (const t of this.timers.values()) clearTimeout(t);
-    this.timers.clear();
   }
 
   check(bin, args = ["version"]) {
@@ -2903,6 +2989,13 @@ class Runner {
     const c = this.children.get(name);
     return !!c && c.exitCode === null && !c.killed;
   }
+}
+
+/** hook 注册小工具：Map<name, fn[]> */
+function pushHook(map, name, fn) {
+  const arr = map.get(name) || [];
+  arr.push(fn);
+  map.set(name, arr);
 }
 
 /** 启动日志脱敏：token/secret/password 不打明文。 */
@@ -3321,10 +3414,20 @@ async function main() {
       domainCheck.fails = 0;
       // 域名一变就立刻重写 kit.txt（不等 60s tick），/kit 下次请求即新值
       dumpKitFile(cfg, kitState);
-    } else if (!domain) {
-      domain = d;
     }
   };
+  // niclink 彻底放弃重启（30 次上限）时：temp 模式清掉域名，
+  // /kit 不再下发已死的链接（dumpKitFile 本来就有存活检查，这里清的是内存里的 domain）
+  runner.onGiveUp("niclink", () => {
+    if (cfg.atLinkMode === "temp" && domain) {
+      logger.status("niclink gave up: clearing temp domain");
+      domain = null;
+      domainCheck.ok = false;
+      domainCheck.reason = "link-gave-up";
+      domainCheck.at = new Date().toISOString();
+      domainCheck.fails = 0;
+    }
+  });
   if (cfg.atLinkMode === "temp") {
     // 每次 spawn（含 Runner 重启）都重绑日志监听，否则重启后的新域名永远收不到
     runner.onSpawn("niclink", (c) => watchLinkOutput(c, onTempDomain));
@@ -3418,7 +3521,7 @@ async function main() {
         domainCheck.fails = 0;
         domain = null; // 清掉旧值：/kit 立刻回占位行，避免吐出已死的旧链接
         domainCheck.reason = "restarting-for-fresh-domain";
-        runner.stop("niclink", true); // Runner 自动按退避重启 + onSpawn 重绑监听
+        runner.restart("niclink", "domain dead, fetching fresh domain"); // 显式重启：stop() 的 exit 会被 stale guard 拦，不能靠它
       }
     };
     const domainTimer = setInterval(domainTick, 60000);
@@ -3442,4 +3545,4 @@ if (process.env.NIC_SKIP_MAIN !== "1") {
   });
 }
 
-export { loadConfig, createCfProbe, Runner, checkSubAuth, wsFrameEncode, wsFrameDecodeOne, MAX_RESTARTS, RESTART_RESET_MS };
+export { loadConfig, createCfProbe, Runner, checkSubAuth, wsFrameEncode, wsFrameDecodeOne, probeTempDomain, isWholeDisk, MAX_RESTARTS, RESTART_RESET_MS };
