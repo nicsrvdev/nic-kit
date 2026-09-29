@@ -35,6 +35,7 @@ docker rmi ghcr.io/nicsrvdev/nic-kit:latest
 | `PORT` / `WS_PATH` / `VLESS_PORT` | `3000` / `/link` / `18000` | HTTP 端口 / ws 路径 / 内部端口 |
 | `AT_LINK_MODE` / `AT_LINK_TOKEN` / `AT_LINK_DOMAIN` | `temp` | `token` 需配齐后两者 |
 | `AT_LINK_PROTOCOL` | `quic` | edge 传输协议：`quic`/`http2`/`auto`（QUIC 被 QoS 时填 `http2` 逃生） |
+| `AT_LINK_CONNECTIONS` | `4` | edge 连接数（`1`-`16`）；填 `1` 最省内存 |
 | `OPT_DOMAIN` | `staticdelivery.nexusmods.com` | 订阅里的地址（SNI 仍是链路域名） |
 | `HY2_PORT` / `VLESS_DIRECT_PORT` | — | 填端口即开启直连（密码自动派生，HOST 留空自动探测） |
 | `HY2_PASSWORD` / `HY2_OBFS` / `HY2_HOST` | — | hy2 可选项 |

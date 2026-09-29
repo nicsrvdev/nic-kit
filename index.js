@@ -12,6 +12,7 @@ const USER_CONFIG = {
   AT_LINK_TOKEN: "",   // AT_LINK_MODE=token 时必填：链路 Token
   AT_LINK_DOMAIN: "",  // AT_LINK_MODE=token 时必填：已绑定的域名
   AT_LINK_PROTOCOL: "", // edge 传输协议：quic|http2|auto，默认 quic；QUIC 被 QoS 时填 http2 逃生
+  AT_LINK_CONNECTIONS: "", // edge 连接数：默认 4（上游 cloudflared 默认）；填 1 最省内存
   OPT_DOMAIN: "",   // vless-link 出口地址（直连CF优选IP）；默认 staticdelivery.nexusmods.com
 
   // ---- 直连 UDP（可选：只填端口即开启） ----
@@ -207,6 +208,7 @@ function loadConfig() {
     atLinkToken: str("AT_LINK_TOKEN", ""),
     atLinkDomain: str("AT_LINK_DOMAIN", ""),
     atLinkProtocol: str("AT_LINK_PROTOCOL", "quic").toLowerCase(),
+    atLinkConnections: int("AT_LINK_CONNECTIONS", 4),
     optDomain: str("OPT_DOMAIN", "staticdelivery.nexusmods.com"),
 
     directUdpPortRaw: str("HY2_PORT", ""),
@@ -312,6 +314,9 @@ function loadConfig() {
   // 不静默回退——协议选错表现为连不上，fail-fast 比 warn 更易定位。
   if (!["quic", "http2", "auto"].includes(cfg.atLinkProtocol)) {
     errors.push(`AT_LINK_PROTOCOL must be quic|http2|auto, got: ${cfg.atLinkProtocol}`);
+  }
+  if (!Number.isInteger(cfg.atLinkConnections) || cfg.atLinkConnections < 1 || cfg.atLinkConnections > 16) {
+    errors.push(`AT_LINK_CONNECTIONS must be 1-16, got: ${cfg.atLinkConnections}`);
   }
   if (cfg.atLinkMode === "token") {
     if (!cfg.atLinkToken) errors.push("AT_LINK_MODE=token requires AT_LINK_TOKEN");
@@ -958,17 +963,20 @@ function buildLinkArgs(cfg, binPath) {
   // AT_LINK_PROTOCOL 直传 --protocol（上游 runQuickLink 仅在未显式设置时才默认 quic，
   // 这里总是显式传，temp/token 两模式行为一致，无隐式覆盖问题）。
   const proto = ["--protocol", cfg.atLinkProtocol];
+  // edge 连接数直传 --ha-connections（覆盖 Go 二进制内默认的 1）；JS 侧默认 4，
+  // 与上游 cloudflared 默认一致。temp/token 两模式共用。
+  const conns = ["--ha-connections", String(cfg.atLinkConnections)];
   if (cfg.atLinkMode === "token") {
     // token 隧道同样需要 --url 把流量转发到本地 niccore，否则 edge 建链成功但无源站（502）
     return {
       bin: binPath,
-      args: ["run", "--no-autoupdate", "--token", cfg.atLinkToken, "--url", target, "--no-tls-verify", ...proto],
+      args: ["run", "--no-autoupdate", "--token", cfg.atLinkToken, "--url", target, "--no-tls-verify", ...proto, ...conns],
       domain: cfg.atLinkDomain,
     };
   }
   return {
     bin: binPath,
-    args: ["--no-autoupdate", "--url", target, "--no-tls-verify", ...proto],
+    args: ["--no-autoupdate", "--url", target, "--no-tls-verify", ...proto, ...conns],
     domain: null, // parsed from log: https://xxx.trycloudflare.com
   };
 }
@@ -3153,6 +3161,7 @@ async function main() {
       uptime_s: Math.floor((Date.now() - startedAt) / 1000),
       at_link_mode: cfg.atLinkMode,
       at_link_protocol: cfg.atLinkProtocol,
+      at_link_connections: cfg.atLinkConnections,
       domain,
       domain_check_ok: domainCheck.ok,
       domain_check_reason: domainCheck.reason,

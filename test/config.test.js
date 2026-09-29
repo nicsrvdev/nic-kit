@@ -47,3 +47,25 @@ test("UUID 格式非法：抛 ECONFIG", () => {
     assert.throws(() => loadConfig(), (e) => e.code === "ECONFIG");
   });
 });
+
+test("AT_LINK_CONNECTIONS 默认 4", () => {
+  const cfg = withEnv({ UUID, AT_LINK_CONNECTIONS: undefined }, () => loadConfig());
+  assert.equal(cfg.atLinkConnections, 4);
+});
+
+test("AT_LINK_CONNECTIONS 自定义值生效", () => {
+  const cfg = withEnv({ UUID, AT_LINK_CONNECTIONS: "1" }, () => loadConfig());
+  assert.equal(cfg.atLinkConnections, 1);
+});
+
+test("AT_LINK_CONNECTIONS 非法值：抛 ECONFIG", () => {
+  for (const v of ["0", "17"]) {
+    withEnv({ UUID, AT_LINK_CONNECTIONS: v }, () => {
+      assert.throws(() => loadConfig(), (e) => e.code === "ECONFIG", `value=${v}`);
+    });
+  }
+  // 非数字：int() 直接抛普通 Error
+  withEnv({ UUID, AT_LINK_CONNECTIONS: "abc" }, () => {
+    assert.throws(() => loadConfig());
+  });
+});
