@@ -3465,35 +3465,60 @@ function checkSubAuth(req, cfg) {
   return false;
 }
 
+// 解析请求行里的 URL。畸形请求目标（`http://`、`//`、`\\` 等 RFC 允许但 new URL 不接受的形式）
+// 在过去会让 new URL 抛 TypeError，而请求处理函数没有兜底 → 未捕获异常 → 整个进程退出
+// （任何人一条 `GET http:// HTTP/1.1` 就能打崩探针）。这里统一兜成 null，由调用方回 400。
+function parseRequestUrl(raw) {
+  try {
+    return new URL(raw || "/", "http://localhost");
+  } catch {
+    return null;
+  }
+}
+
 function startServer(cfg, state) {
   const server = createServer((req, res) => {
-    const url = new URL(req.url || "/", `http://localhost`);
-    if (url.pathname === "/health") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, ...dlStatus(), ...state.status() }));
-      return;
-    }
-    if (url.pathname === "/sub" || url.pathname === "/kit") {
-      if (!checkSubAuth(req, cfg)) {
-        res.writeHead(401, { "content-type": "text/plain" });
-        res.end("unauthorized\n");
+    // 请求处理整体兜底：任何同步异常都只回 500，绝不允许打死进程
+    try {
+      const url = parseRequestUrl(req.url);
+      if (!url) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("bad request\n");
         return;
       }
-      const links = buildSubEntries(cfg, state);
-      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-      res.end(links.join("\n") + "\n");
-      return;
+      if (url.pathname === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, ...dlStatus(), ...state.status() }));
+        return;
+      }
+      if (url.pathname === "/sub" || url.pathname === "/kit") {
+        if (!checkSubAuth(req, cfg)) {
+          res.writeHead(401, { "content-type": "text/plain" });
+          res.end("unauthorized\n");
+          return;
+        }
+        const links = buildSubEntries(cfg, state);
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        res.end(links.join("\n") + "\n");
+        return;
+      }
+      if (url.pathname === "/" || url.pathname === "/index.html") {
+        servePublicFile(res, "index.html");
+        return;
+      }
+      if (url.pathname === "/javascript-obfuscator.js") {
+        servePublicFile(res, "javascript-obfuscator.js");
+        return;
+      }
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("not found\n");
+    } catch (e) {
+      logger.warn(`http handler error: ${(e && e.message) || e}`);
+      try {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("internal error\n");
+      } catch {}
     }
-    if (url.pathname === "/" || url.pathname === "/index.html") {
-      servePublicFile(res, "index.html");
-      return;
-    }
-    if (url.pathname === "/javascript-obfuscator.js") {
-      servePublicFile(res, "javascript-obfuscator.js");
-      return;
-    }
-    res.writeHead(404, { "content-type": "text/plain" });
-    res.end("not found\n");
   });
 
   server.listen(cfg.port, () => {
@@ -3950,6 +3975,7 @@ if (process.env.NIC_SKIP_MAIN !== "1") {
 
 export {
   loadConfig,
+  parseRequestUrl,
   createCfProbe,
   Runner,
   checkSubAuth,
