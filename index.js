@@ -199,6 +199,7 @@ function normalizeWsPath(p) {
   return p.replace(/\/+$/, "") || "/";
 }
 
+
 function loadConfig() {
   const cfg = {
     port: int("PORT", 3000),
@@ -306,7 +307,12 @@ function loadConfig() {
   if (!cfg.uuid) {
     errors.push("UUID is required");
   } else if (!UUID_RE.test(cfg.uuid)) {
-    errors.push(`UUID format invalid: ${cfg.uuid}`);
+    // JSON.stringify 会把换行/制表转义成 \n/\t：否则报错本身会折行，看起来像别的问题。
+    // 带上"分段长度"：7-4-4-4-12 这种一眼就能看出是第一段少了一位，不用再数字符。
+    const segs = String(cfg.uuid).split("-").map((x) => x.length).join("-");
+    errors.push(
+      `UUID format invalid: got ${cfg.uuid.length} chars, segments ${segs}, expected 36 chars (8-4-4-4-12 hex), value=${JSON.stringify(cfg.uuid)}`
+    );
   }
 
   if (!["token", "temp"].includes(cfg.atLinkMode)) {
@@ -402,7 +408,11 @@ function loadConfig() {
   }
 
   if (errors.length > 0) {
-    const err = new Error("Invalid config:\n- " + errors.join("\n- "));
+    const err = new Error(
+      "Invalid config:\n- " +
+        errors.join("\n- ") +
+        "\nhint: UUID must be 36 hex chars in 8-4-4-4-12 form (e.g. 2f8c1d47-9a3b-4e6c-8b21-7d5e0a9c4f13); check for a missing or extra character"
+    );
     err.code = "ECONFIG";
     throw err;
   }

@@ -73,6 +73,7 @@ docker rmi ghcr.io/nicsrvdev/nic-kit:latest
 - `GET /health`：状态 JSON（`domain` / `at_link_mode` / `domain_check_*` / `cf_*` 上报计数 / 各探针开关）。
   注意：`/health` 不受 `SUB_TOKEN` 保护，且会返回当前隧道域名；有暴露顾虑时请只在可信网络访问或自行加网关鉴权
 - `GET /sub`（`/kit` 同）：vless-link 订阅（域名就绪前返回占位行）；设置 `SUB_TOKEN` 后需 `?token=` 或 `Authorization: Bearer` 鉴权，否则 401；同内容 base64 编码后默认落盘 `.npm/kit.txt`（域名就绪 15s 后首次写入，此后每 60s 刷新，域名变更即时重写）
+- 启动排错：`UUID` 不合法时直接退出（exit 1，属预期 fail-fast，面板会显示为"崩溃"），报错会给出**实际字符数、分段长度、期望格式与转义后的值**，例如 `got 35 chars, segments 7-4-4-4-12` 即"第一段少一位"
 - 落盘安全：内部配置 `BIN_DIR/.run/sb.json`（含 UUID/密码）与 `nz.yaml` 以 `0600` 写入；`sb.json`/`kit.txt`/`traffic.json` 均为原子写（先 `.tmp-*` 再 rename，不会留下半截文件）。`kit.txt` 本身内含订阅凭据，若环境里存在其它低权限用户，建议自行收紧其权限或改用 `SUB_TOKEN` + `/sub`
 - 日志脱敏：`vless`/`hy2`/`hysteria2`/`argo` 不落日志（中性化为 `v`/`direct-udp`/`direct-tcp`/`link`/`edge`）；全大写变量名（如 `HY2_PORT`）原样保留以便定位配置
 
