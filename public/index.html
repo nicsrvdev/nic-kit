@@ -4,7 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DevTools · UUID 生成 & JS 混淆</title>
-<script src="https://cdn.jsdelivr.net/npm/javascript-obfuscator@4.3.0/dist/index.browser.js"></script>
+<!-- CDN 优先，失败/被篡改（SRI 不匹配）时自动回退本地同目录文件。
+     注意：@4.3.0 这个版本 npm 上并不存在（CDN 一直 404），已修正为与本地
+     vendor 包逐字节一致的 5.8.0，并用 integrity 锁定哈希。 -->
+<script src="https://cdn.jsdelivr.net/npm/javascript-obfuscator@5.8.0/dist/index.browser.js"
+        integrity="sha384-7mxzS3M1M8D0Tolaot1E9Eem228SIuZdu6zfFZyIAJ9zmgilz3SnxvqDRbJJRm06"
+        crossorigin="anonymous"></script>
 <script>
   // CDN 失败时回退本地同目录文件
   if (typeof JavaScriptObfuscator === "undefined") {

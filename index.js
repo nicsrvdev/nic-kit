@@ -75,7 +75,7 @@ import { promises as fs, createWriteStream } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { arch, cpus, freemem, hostname, platform, totalmem } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -636,6 +636,33 @@ function scheduleBinaryTtl(cfg, runner) {
 }
 
 /**
+ * 原子写文件：先写同目录临时文件，fsync 后 rename 覆盖目标。
+ * 直接 writeFile 在进程被强杀/磁盘写满时会留下半截文件（JSON 解析失败、
+ * 面板读到半截订阅）。临时文件与目标同目录，rename 是原子操作。
+ * opts.mode 为 0 时保持默认权限。
+ */
+async function writeFileAtomic(path, data, opts = {}) {
+  const dir = dirname(path);
+  await fs.mkdir(dir, { recursive: true });
+  const part = join(dir, `.${basename(path)}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`);
+  let fh = null;
+  try {
+    fh = await fs.open(part, "w", opts.mode || 0o666);
+    await fh.writeFile(data);
+    await fh.sync().catch(() => {}); // 部分文件系统不支持 fsync，忽略
+  } finally {
+    if (fh) await fh.close().catch(() => {});
+  }
+  if (opts.mode) await fs.chmod(part, opts.mode).catch(() => {});
+  try {
+    await fs.rename(part, path);
+  } catch (e) {
+    await fs.rm(part, { force: true }).catch(() => {});
+    throw e;
+  }
+}
+
+/**
  * 下载文件到 dest。
  * 全程异步（fetch + 流式写盘）：不阻塞事件循环，下载期间 /health 正常应答、
  * SIGTERM 能及时处理，多个下载也能真正并发。
@@ -1076,9 +1103,10 @@ function buildSingBoxConfig(cfg, tls = null) {
  */
 async function writeSingBoxConfig(cfg, dir = ".", tls = null) {
   const obj = buildSingBoxConfig(cfg, tls);
-  await fs.mkdir(join(cfg.binDir, ".run"), { recursive: true });
   const path = join(cfg.binDir, ".run", "sb.json");
-  await fs.writeFile(path, JSON.stringify(obj, null, 2));
+  // sb.json 含 vless UUID 与各直连密码：0600 + 原子写。
+  // （实测旧实现是 0644 世界可读；半截 JSON 也会让 niccore 起不来）
+  await writeFileAtomic(path, JSON.stringify(obj, null, 2), { mode: 0o600 });
   const tags = obj.inbounds.map((i) => i.tag).join(",");
   logger.info(`niccore.json written: ${path} (inbounds: ${tags})`);
   return path;
@@ -1172,24 +1200,28 @@ async function probeTempDomain(domain, timeoutMs = 15000) {
  * Security defaults: disable_command_execute=true unless NEZHA_ALLOW_COMMAND=1.
  */
 function buildNezhaYaml(cfg) {
+  // 字符串值一律输出 JSON 双引号标量（JSON 字符串是合法 YAML 标量）。
+  // 裸标量实测（PyYAML 复现）：`abc #def` 被当注释静默截断成 `abc`；
+  // `&abc` / `#abc` 直接解析成 null；`k: x`、`[::1]:8008`、`@abc`、`*abc`
+  // 会让解码报错 —— 前两种是"key 变成错的"，后一种是 nezha-agent 起不来。
+  // 引号化后这些值都能原样解析。
+  const q = (v) => JSON.stringify(String(v ?? ""));
   const lines = [
-    `server: ${cfg.nezhaServer}`,
-    `client_secret: ${cfg.nezhaKey}`,
+    `server: ${q(cfg.nezhaServer)}`,
+    `client_secret: ${q(cfg.nezhaKey)}`,
     `tls: ${cfg.nezhaTls ? "true" : "false"}`,
     `disable_command_execute: ${cfg.nezhaAllowCommand ? "false" : "true"}`,
     `disable_auto_update: true`,
     `disable_force_update: true`,
     `report_delay: 3`,
   ];
-  if (cfg.nezhaUuid) lines.push(`uuid: ${cfg.nezhaUuid}`);
+  if (cfg.nezhaUuid) lines.push(`uuid: ${q(cfg.nezhaUuid)}`);
   return lines.join("\n") + "\n";
 }
 
 async function writeNezhaYaml(cfg) {
   const path = join(cfg.binDir, ".run", "nz.yaml");
-  await fs.mkdir(join(cfg.binDir, ".run"), { recursive: true });
-  await fs.writeFile(path, buildNezhaYaml(cfg), { mode: 0o600 });
-  await fs.chmod(path, 0o600);
+  await writeFileAtomic(path, buildNezhaYaml(cfg), { mode: 0o600 });
   logger.info(`nezha config written: ${path}`);
   return path;
 }
@@ -1631,8 +1663,8 @@ async function saveTraffic(now = Date.now()) {
   if (!trafficState.ready || !trafficState.path) return;
   trafficState.lastSaveAt = now;
   try {
-    await fs.mkdir(dirname(trafficState.path), { recursive: true });
-    await fs.writeFile(
+    // 原子写：半截 JSON 下次启动解析失败 → 月流量计数被静默清零
+    await writeFileAtomic(
       trafficState.path,
       JSON.stringify({
         month_key: trafficState.monthKey,
@@ -3398,8 +3430,8 @@ async function dumpKitFile(cfg, state) {
       return;
     }
     const body = Buffer.from(links.join("\n") + "\n", "utf8").toString("base64") + "\n";
-    await fs.mkdir(dirnameKit(cfg.kitFile), { recursive: true });
-    await fs.writeFile(cfg.kitFile, body);
+    // 原子写：面板/脚本可能正好在刷新间隙读这个文件，半截内容会解析失败
+    await writeFileAtomic(cfg.kitFile, body);
     logger.info(`kit nodes written: ${cfg.kitFile} (${links.length} links, base64)`);
   } catch (e) {
     logger.warn(`kit.txt write failed: ${e.message}`);
@@ -3976,6 +4008,10 @@ if (process.env.NIC_SKIP_MAIN !== "1") {
 export {
   loadConfig,
   parseRequestUrl,
+  writeFileAtomic,
+  buildNezhaYaml,
+  writeSingBoxConfig,
+  writeNezhaYaml,
   createCfProbe,
   Runner,
   checkSubAuth,
