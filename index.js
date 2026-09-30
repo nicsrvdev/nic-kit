@@ -1182,23 +1182,35 @@ function watchLinkOutput(child, onDomain) {
 /** 拨测 temp 域名是否存活：纯 HTTPS GET /（可达即活；502/503=隧道真死；超时/网络异常算"可疑"）。
  * 注意：fetch 不允许手拼 Upgrade 头（undici 直接抛 invalid upgrade header），
  * 所以这里只能是普通 GET——它验证的是 edge 可达 + 源站有响应，足够做存活判断。 */
-async function probeTempDomain(domain, timeoutMs = 15000) {
+async function probeTempDomain(domain, timeoutMs = 15000, wsPath = "/link", connectFn = wsConnect) {
   const host = String(domain || "").replace(/^https?:\/\//, "").replace(/\/+$/, "");
   if (!host) return { ok: false, reason: "empty" };
+  const path = normalizeWsPath(wsPath || "/link");
   try {
-    const res = await fetch(`https://${host}/`, {
-      method: "GET",
-      headers: { "User-Agent": "nic-kit-domaincheck" },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    // 502 = 源站（niccore）无响应；503 = edge 上隧道已注销/不可用；
-    // 530/429（edge 限流）判活，否则限流时段 niclink 会被反复杀（本地实测 restart 死循环）。
-    if (res.status === 502 || res.status === 503) {
-      return { ok: false, reason: `http=${res.status}` };
-    }
-    return { ok: true, reason: `http=${res.status}` };
+    // 用真实客户端同款 WS 握手探测（GET <wsPath> + Upgrade 头），而不是裸 GET /：
+    // 裸 GET 会打到 vless-link 入站的错误路径上，niccore 每分钟记一条
+    // `ERROR inbound/v[link]: bad path: /`，日志噪音极大且看着像故障。
+    // WS 握手带正确的路径：路径配对时 niccore 正常接受（101），日志干净；
+    // 顺带还验证了"隧道 + WS 路径"这条真实链路是通的。
+    const { sock } = await connectFn(
+      `wss://${host}${path}`,
+      { "User-Agent": "nic-kit-domaincheck" },
+      timeoutMs
+    );
+    try { sock && sock.destroy(); } catch {}
+    return { ok: true, reason: "ws=101" };
   } catch (e) {
-    return { ok: false, reason: String(e.message || e).slice(0, 80) };
+    const msg = String((e && e.message) || e);
+    const m = msg.match(/http=(\d{3})/);
+    if (m) {
+      const code = Number(m[1]);
+      // 502 = 源站（niccore）无响应；503 = edge 上隧道已注销/不可用 → 判死
+      if (code === 502 || code === 503) return { ok: false, reason: `http=${code}` };
+      // 其它状态码（400 路径/协议不匹配、403、404、429、530 限流…）：
+      // edge 活着且源站有响应 → 判活（否则限流时段会把还能用的隧道掐掉）
+      return { ok: true, reason: `http=${code}` };
+    }
+    return { ok: false, reason: msg.slice(0, 80) };
   }
 }
 
@@ -3271,14 +3283,19 @@ class Runner {
       ...opts,
     });
     const onChunk = (d) => {
-      // 分块到达即处理，不累积；单块截断 500/300 字符
+      // 分块到达即处理，不累积；按行拆分逐行判定（一个 chunk 里可能混着多行，
+      // 混着"噪音 + 真错误"时不能整块吞掉），单行截断 500/300 字符
       const raw = String(d);
-      const head = raw.length > 500 ? raw.slice(0, 500) : raw;
-      const line = head.trim();
-      if (!line) return;
-      logger.debug(`[${name}] ${line}`);
-      if (/ERR|error|panic|failed|Couldn't/i.test(line)) {
-        logger.warn(`[${name}] ${line.length > 300 ? line.slice(0, 300) : line}`);
+      const head = raw.length > 2000 ? raw.slice(0, 2000) : raw;
+      for (const rawLine of head.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        logger.debug(`[${name}] ${line}`);
+        // niccore 的"非 vless 连接"噪音（含我们自己的存活拨测）降到 debug 并计数
+        if (name === "niccore" && isLinkInboundNoise(line)) continue;
+        if (/ERR|error|panic|failed|Couldn't/i.test(line)) {
+          logger.warn(`[${name}] ${line.length > 300 ? line.slice(0, 300) : line}`);
+        }
       }
     };
     child.stdout && child.stdout.on("data", onChunk);
@@ -3391,6 +3408,31 @@ class Runner {
     const c = this.children.get(name);
     return !!c && c.exitCode === null && !c.killed;
   }
+}
+
+// --- niccore 逐连接日志降噪 ---------------------------------------------------
+// vless-link 入站只接受「WS + vless」流量；任何其它连接（包括我们每 60s 一次的
+// 域名存活拨测、以及用户用浏览器/curl 直接访问隧道域名）都会让 niccore 记一条 ERROR：
+//   inbound/v[link]: process connection from <ip>:<port>: bad path: /
+//   inbound/v[link]: process connection from <ip>:<port>: EOF
+//   inbound/v[link]: process connection from <ip>:<port>: upgrade websocket connection: handshake error: ...
+// 这是逐连接噪音而不是故障（拨测本身靠它拿到 404/400 判活）。默认降到 debug，
+// 同时计数，/health 里以 link_bad_requests 暴露；要逐条看把 LOG_LEVEL=debug 即可。
+const linkNoise = { count: 0, lastAt: "" };
+// 注意：不加 $ 锚定 —— niccore 的日志是"按块"送来的，一个 chunk 里可能还有后续行，
+// 锚定行尾会漏判。
+const LINK_NOISE_RE =
+  /inbound\/v\[link\]: process connection from [^\s:]+:\d+: (EOF|bad path: \S*|upgrade websocket connection: handshake error[^\r\n]*)/;
+function isLinkInboundNoise(line) {
+  // 关键：niccore 原始输出是 `inbound/vless[vless-link]: ...`，
+  // 日志展示层 cleanLog 才会把它中性化成 `inbound/v[link]: ...`。
+  // 直接拿原始字节去匹配"展示用"的正则会永远失配（实测踩过：link_bad_requests 一直 0，
+  // 而日志里看到的行是被清洗过的，肉眼和字节级抽样都会骗过验证）。
+  const shown = cleanLog(String(line));
+  if (!LINK_NOISE_RE.test(shown)) return false;
+  linkNoise.count += 1;
+  linkNoise.lastAt = new Date().toISOString();
+  return true;
 }
 
 /** hook 注册小工具：Map<name, fn[]> */
@@ -3712,6 +3754,8 @@ async function main() {
       komari_enabled: cfg.komariEnabled,
       komari_state: monitorState.komari,
       komari_running: runner.children.has("node-monitor"),
+      link_bad_requests: linkNoise.count,
+      link_bad_last_at: linkNoise.lastAt,
       ...(cfProbe ? cfProbe.getStatus() : { cf_enabled: cfg.cfEnabled, cf_running: false }),
     }),
   });
@@ -3969,7 +4013,7 @@ async function main() {
   if (cfg.atLinkMode === "temp") {
     const domainTick = async () => {
       if (!domain || !runner.isAlive("niclink")) return; // 未就绪/重建中：跳过
-      const r = await probeTempDomain(domain);
+      const r = await probeTempDomain(domain, 15000, cfg.wsPath);
       domainCheck.at = new Date().toISOString();
       if (r.ok) {
         if (domainCheck.ok === false) logger.status(`niclink ok: domain reachable again (${r.reason})`);
@@ -4018,6 +4062,8 @@ if (process.env.NIC_SKIP_MAIN !== "1") {
 export {
   loadConfig,
   parseRequestUrl,
+  isLinkInboundNoise,
+  linkNoise,
   writeFileAtomic,
   buildNezhaYaml,
   writeSingBoxConfig,
