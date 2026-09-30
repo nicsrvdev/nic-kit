@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
+# Go 工具链版本：全局 ARG 提供默认值，必须在 stage 内重新声明才能生效（否则是死代码）
 ARG GOTOOLCHAIN=go1.26.8
 FROM golang:1.26-bookworm AS gobuild
+ARG GOTOOLCHAIN
 
 WORKDIR /src
 COPY gosrc/go.mod gosrc/go.sum ./

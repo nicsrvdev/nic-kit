@@ -57,10 +57,21 @@ docker rmi ghcr.io/nicsrvdev/nic-kit:latest
 
 优先级：环境变量 > `USER_CONFIG` > 默认值。探针变量缺一半仅警告不启用；非法 `HY2_PORT` 等只警告降级。
 
+探针语义补充：
+
+- `net_rx_monthly` / `net_tx_monthly` 是**本月累计**（超出面板下发的 `reset_day` 账期即清零），
+  持久化在 `BIN_DIR/.run/traffic.json`，跨重启继续累计（最多丢失最近 60 秒）；面板下发的
+  `rx_correction` / `tx_correction` 会作为本月基准覆盖。
+- 动态配置里未知字段只忽略并告警，不影响同批下发的合法字段生效。
+- temp 域名拨测：edge 明确返回 502/503 时连续 2 次失败即换域名；超时/DNS 等网络类失败容错 3 次，
+  避免网络抖动误杀仍可用的隧道。
+- 自签证书 CN/SAN 取 `VLESS_DIRECT_SNI`（vless-direct）或 `HY2_HOST`，并带上自动探测到的公网 IP。
+
 ## 接口
 
 - `GET /`：工具页（UUID 生成 + JS 混淆，混淆引擎 CDN 优先、失败回退本地）
-- `GET /health`：状态 JSON（`domain` / `at_link_mode` / `domain_check_*` / `cf_*` 上报计数 / 各探针开关）
+- `GET /health`：状态 JSON（`domain` / `at_link_mode` / `domain_check_*` / `cf_*` 上报计数 / 各探针开关）。
+  注意：`/health` 不受 `SUB_TOKEN` 保护，且会返回当前隧道域名；有暴露顾虑时请只在可信网络访问或自行加网关鉴权
 - `GET /sub`（`/kit` 同）：vless-link 订阅（域名就绪前返回占位行）；设置 `SUB_TOKEN` 后需 `?token=` 或 `Authorization: Bearer` 鉴权，否则 401；同内容 base64 编码后默认落盘 `.npm/kit.txt`（域名就绪 15s 后首次写入，此后每 60s 刷新，域名变更即时重写）
 - 日志脱敏：`vless`/`hy2`/`hysteria2`/`argo` 不落日志（中性化为 `v`/`direct-udp`/`direct-tcp`/`link`/`edge`）；全大写变量名（如 `HY2_PORT`）原样保留以便定位配置
 
@@ -76,11 +87,14 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o niclink-linux-amd64 ./nicli
 
 push `main` 即全自动发版：二进制 tag（取 `index.js` 中 `FALLBACK`）自动移到 HEAD 并重发 release；镜像自动推 GHCR `latest`。
 
-Node 侧单测（无第三方依赖）：`npm test`（`test/`：配置校验 / WSS 帧编解码 / 订阅鉴权 / Runner 重启计数）。
+Node 侧单测（无第三方依赖）：`npm test`（等价于 `node --test`，Node 18+ 均可运行）。
+覆盖：配置校验 / 下载非阻塞与容错 / WSS 帧编解码 / 心跳上报节奏 / 动态配置 / 采集去重与磁盘缓存 /
+月度流量账期 / 订阅链接与鉴权 / 公网 IP 校验 / 临时域名拨测 / Runner 重启计数。
 
 ## 依赖
 
-Node `>=18`。需 `curl`/`wget`；直连需 `openssl`；nezha 需 `unzip`。
+Node `>=18`（无需 `curl`/`wget`，二进制下载走内置 fetch + 流式写盘）。
+直连（`HY2_PORT`/`VLESS_DIRECT_PORT`）需 `openssl` 生成自签证书；nezha 探针需 `unzip`。
 
 ## 许可证
 

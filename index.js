@@ -71,11 +71,13 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { connect as tlsConnect } from "node:tls";
 import { createSocket } from "node:dgram";
-import { promises as fs } from "node:fs";
+import { promises as fs, createWriteStream } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { arch, cpus, freemem, hostname, platform, totalmem } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 // ---- src/logger.js ----
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3, off: 4 };
@@ -414,16 +416,31 @@ function LOG_LEVEL_OK(l) {
   return ["debug", "info", "warn", "error", "off"].includes(l);
 }
 
+// 所有密钥字段必须在这里掩码（debug 日志会整体转储 cfg）。
+// 新增密钥类配置项时，务必同步补一行，否则会明文落日志。
+const SECRET_KEYS = [
+  "atLinkToken",
+  "directUdpPassword",
+  "directUdpObfs",
+  "nezhaKey",
+  "komariToken",
+  "cfSecret",
+  "ghToken",
+  "subToken",
+];
 function redact(cfg) {
   const out = { ...cfg };
-  if (out.atLinkToken) out.atLinkToken = "***";
-  if (out.uuid) out.uuid = out.uuid.slice(0, 8) + "-****";
-  if (out.directUdpPassword) out.directUdpPassword = "***";
-  if (out.directUdpObfs) out.directUdpObfs = "***";
-  if (out.nezhaKey) out.nezhaKey = "***";
-  if (out.komariToken) out.komariToken = "***";
-  if (out.cfSecret) out.cfSecret = "***";
-  if (out.ghToken) out.ghToken = "***";
+  const uuid = cfg.uuid;
+  const maskId = (v) => (v ? String(v).slice(0, 8) + "-****" : v);
+  if (out.uuid) out.uuid = maskId(out.uuid);
+  // 派生 ID（探针节点 ID / nezha UUID 默认复用主 UUID）同样截断，
+  // 否则 uuid 那行的掩码会被另一个字段原样还原
+  for (const k of ["cfNodeId", "nezhaUuid"]) {
+    if (out[k] && uuid && out[k] === uuid) out[k] = maskId(out[k]);
+  }
+  for (const k of SECRET_KEYS) {
+    if (out[k]) out[k] = "***";
+  }
   return out;
 }
 
@@ -477,8 +494,42 @@ async function resolveTag(repo, pinned, fallback, ghToken = "") {
   }
 }
 
+// 可执行文件探测结果缓存（进程生命周期内不变；避免每次调用都 fork 一个 sh）
+const __haveCache = new Map();
 function have(cmd) {
-  return spawnSync("sh", ["-c", `command -v ${cmd} >/dev/null 2>&1`], { stdio: "ignore" }).status === 0;
+  if (__haveCache.has(cmd)) return __haveCache.get(cmd);
+  const ok = spawnSync("sh", ["-c", `command -v ${cmd} >/dev/null 2>&1`], { stdio: "ignore" }).status === 0;
+  __haveCache.set(cmd, ok);
+  return ok;
+}
+
+/** 异步 execFile 包装：不阻塞事件循环（下载/解压/自检等外部命令统一走这里）。 */
+function execFileAsync(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    execFile(
+      cmd,
+      args,
+      { timeout: opts.timeout || 60000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8", ...opts },
+      (err, stdout, stderr) => {
+        const out = `${stdout || ""}${stderr || ""}`;
+        if (err && (err.code === "ENOENT" || err.code === "EACCES")) {
+          resolve({ ok: false, missing: true, code: null, out: out || String(err.message || err), error: err });
+          return;
+        }
+        resolve({
+          ok: !err,
+          missing: false,
+          code: err ? (typeof err.code === "number" ? err.code : 1) : 0,
+          out: out || (err ? String(err.message || err) : ""),
+          error: err || null,
+        });
+      }
+    );
+  });
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /** 临时目录：TMPDIR > BIN_DIR/tmp（避开小 /tmp） */
@@ -584,40 +635,81 @@ function scheduleBinaryTtl(cfg, runner) {
   if (t.unref) t.unref();
 }
 
+/**
+ * 下载文件到 dest。
+ * 全程异步（fetch + 流式写盘）：不阻塞事件循环，下载期间 /health 正常应答、
+ * SIGTERM 能及时处理，多个下载也能真正并发。
+ * 落盘策略：先写 dest 同目录的临时文件 .part-*，大小校验通过后原子 rename 覆盖 dest。
+ * 这样进程被强杀/网络中断都不会在 dest 留下半截文件（半截二进制会被当成有效文件，
+ * 导致子进程反复快速崩溃、退避到 30 次上限后彻底放弃，见 runner 的快速失败处理）。
+ */
 async function downloadFile(url, dest, opts = {}) {
   const minSize = opts.minSize || 0;
-  // 确保 dest 的父目录存在（原先正则多剥了一层，实际建的是祖父目录）
-  await fs.mkdir(join(dest, ".."), { recursive: true }).catch(() => {});
-  // 清掉上次失败的残留，避免断点续传式的半截文件被当成完整包
+  const retries = Number.isInteger(opts.retries) ? opts.retries : 2;
+  const timeoutMs = opts.timeoutMs || 300000;
+  // 确保 dest 的父目录存在
+  await fs.mkdir(dirname(dest), { recursive: true }).catch(() => {});
+  // 清掉上次失败的残留（含旧版本可能留下的半截文件）
   await fs.rm(dest, { force: true }).catch(() => {});
-  if (have("curl")) {
-    const r = spawnSync("curl", ["-fsSL", "--retry", "3", "--max-time", "300", "-o", dest, url], { stdio: "inherit" });
-    if (r.status !== 0) throw new Error(`curl download failed: ${url}`);
-  } else if (have("wget")) {
-    const r = spawnSync("wget", ["-O", dest, url], { stdio: "inherit" });
-    if (r.status !== 0) throw new Error(`wget download failed: ${url}`);
-  } else {
-    // pure-node fallback
-    logger.warn("no curl/wget, using node fetch fallback");
-    const res = await fetch(url, { headers: { "User-Agent": "nic-kit" } });
-    if (!res.ok) throw new Error(`fetch ${res.status}: ${url}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    await fs.writeFile(dest, buf);
-  }
-  if (minSize > 0) {
-    const st = await fs.stat(dest).catch(() => null);
-    const size = st ? st.size : 0;
-    if (size < minSize) {
-      await fs.rm(dest, { force: true }).catch(() => {});
-      throw new Error(`download incomplete: ${url} got ${size} bytes, expect >= ${minSize}`);
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const part = `${dest}.part-${process.pid}-${randomBytes(3).toString("hex")}`;
+    try {
+      await fetchToFile(url, part, timeoutMs);
+      // 大小校验放在 rename 之前：不合格的临时文件直接丢弃，dest 永远不会出现坏文件
+      if (minSize > 0) {
+        const st = await fs.stat(part).catch(() => null);
+        const size = st ? st.size : 0;
+        if (size < minSize) {
+          throw new Error(`download incomplete: ${url} got ${size} bytes, expect >= ${minSize}`);
+        }
+      }
+      if (opts.mode) await fs.chmod(part, opts.mode);
+      await fs.rename(part, dest);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      await fs.rm(part, { force: true }).catch(() => {});
+      if (attempt < retries) {
+        const delay = 1000 * Math.pow(2, attempt);
+        logger.warn(`download failed (${e.message}), retry ${attempt + 1}/${retries} in ${delay}ms`);
+        await sleep(delay);
+      }
     }
+  }
+  if (lastErr) throw lastErr;
+}
+
+/** 单次下载：流式落盘（大文件不进内存），失败时删掉半截文件。 */
+async function fetchToFile(url, dest, timeoutMs) {
+  const res = await fetch(url, {
+    headers: { "User-Agent": "nic-kit" },
+    redirect: "follow",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`fetch ${res.status}: ${url}`);
+  const ws = createWriteStream(dest);
+  try {
+    if (!res.body) {
+      ws.end();
+      await new Promise((resolve, reject) => {
+        ws.on("finish", resolve);
+        ws.on("error", reject);
+      });
+      return;
+    }
+    await pipeline(Readable.fromWeb(res.body), ws);
+  } catch (e) {
+    try { ws.destroy(); } catch {}
+    throw e;
   }
 }
 
 async function ensureNiccore(cfg) {
   const arch = detectArch();
   const dest = binPath(cfg, "niccore");
-  if (await exists(dest)) {
+  if (await usableBinary(dest)) {
     logger.info(`niccore exists: ${dest}`);
     return dest;
   }
@@ -629,13 +721,9 @@ async function ensureNiccore(cfg) {
     cfg.ghProxy
   );
   logger.info(`downloading niccore ${tag} (${arch})`);
-  const workDir = await workTmpDir(cfg);
-  const tmp = join(workDir, `${asset}-${Date.now()}`);
-  await downloadFile(url, tmp, { minSize: 1024 * 1024 });
-  await fs.mkdir(cfg.binDir, { recursive: true });
-  await fs.copyFile(tmp, dest);
-  await fs.chmod(dest, 0o755);
-  await fs.rm(tmp, { force: true }).catch(() => {});
+  // 直接下到 dest：downloadFile 先写 .part-* 再原子 rename，不存在半截文件，
+  // 因此不再需要"下到 tmp → copyFile → chmod"这一圈（省一次 20MB+ 的拷贝与双倍磁盘占用）
+  await downloadFile(url, dest, { minSize: 1024 * 1024, mode: 0o755 });
   markFreshBinary(dest);
   logger.info(`niccore ready: ${dest}`);
   return dest;
@@ -644,7 +732,7 @@ async function ensureNiccore(cfg) {
 async function ensureNiclink(cfg) {
   const arch = detectArch();
   const dest = binPath(cfg, "niclink");
-  if (await exists(dest)) {
+  if (await usableBinary(dest)) {
     logger.info(`niclink exists: ${dest}`);
     return dest;
   }
@@ -656,13 +744,7 @@ async function ensureNiclink(cfg) {
     cfg.ghProxy
   );
   logger.info(`downloading niclink ${tag} (${arch})`);
-  const workDir = await workTmpDir(cfg);
-  const tmp = join(workDir, `${asset}-${Date.now()}`);
-  await downloadFile(url, tmp, { minSize: 1024 * 1024 });
-  await fs.mkdir(cfg.binDir, { recursive: true });
-  await fs.copyFile(tmp, dest);
-  await fs.chmod(dest, 0o755);
-  await fs.rm(tmp, { force: true }).catch(() => {});
+  await downloadFile(url, dest, { minSize: 1024 * 1024, mode: 0o755 });
   markFreshBinary(dest);
   logger.info(`niclink ready: ${dest}`);
   return dest;
@@ -675,6 +757,47 @@ async function exists(p) {
   } catch {
     return false;
   }
+}
+
+/**
+ * 二进制可用性判断：不只是"文件存在"，还要看大小是否合理。
+ * 半截下载（进程被强杀/镜像返回截断内容）留下的文件会被当成有效二进制，
+ * 子进程随即快速崩溃并退避到 30 次上限后放弃，实例再也不会自愈。
+ * 真实 niccore/niclink/nezha/komari 都是 5MB+ 的静态二进制，低于下限即视为损坏并重新下载。
+ */
+const MIN_SANE_BIN = 512 * 1024;
+async function usableBinary(dest) {
+  const st = await fs.stat(dest).catch(() => null);
+  if (!st) return false;
+  if (st.size < MIN_SANE_BIN) {
+    logger.warn(`binary looks truncated (${st.size} bytes < ${MIN_SANE_BIN}): ${dest}, re-downloading`);
+    await fs.rm(dest, { force: true }).catch(() => {});
+    return false;
+  }
+  return true;
+}
+
+/** 清理上次遗留的下载临时文件（正在写入的跳过），避免 .bin 目录堆积 .part-* */
+async function sweepStalePartials(cfg) {
+  let entries = [];
+  try {
+    entries = await fs.readdir(cfg.binDir);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of entries) {
+    if (!/\.part-\d+-[0-9a-f]+$/.test(name)) continue;
+    const p = join(cfg.binDir, name);
+    try {
+      const st = await fs.stat(p);
+      if (Date.now() - st.mtimeMs < 10 * 60 * 1000) continue; // 可能仍在下载
+      await fs.rm(p, { force: true });
+      removed++;
+    } catch {}
+  }
+  if (removed > 0) logger.info(`stale download leftovers cleaned: ${removed} in ${cfg.binDir}`);
+  return removed;
 }
 
 async function findFile(dir, name) {
@@ -708,21 +831,14 @@ function komariAssetUrl(tag, arch, ghProxy) {
 }
 
 async function downloadBinary(cfg, url, dest) {
-  const workDir = await workTmpDir(cfg);
-  const tmp = join(workDir, `dl-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
-  await downloadFile(url, tmp, { minSize: 1024 * 1024 });
-  const dir = join(dest, "..");
-  await fs.mkdir(dir, { recursive: true });
-  await fs.copyFile(tmp, dest);
-  await fs.chmod(dest, 0o755);
-  await fs.rm(tmp, { force: true }).catch(() => {});
+  await downloadFile(url, dest, { minSize: 1024 * 1024, mode: 0o755 });
 }
 
 /** nezha-agent ships as a zip containing one `nezha-agent` binary. */
 async function ensureNezha(cfg) {
   const arch = goArch();
   const dest = binPath(cfg, "nezha");
-  if (await exists(dest)) {
+  if (await usableBinary(dest)) {
     logger.info(`sys-monitor exists: ${dest}`);
     return dest;
   }
@@ -734,8 +850,8 @@ async function ensureNezha(cfg) {
   const outDir = join(await workTmpDir(cfg), `nezha-${tag}-${arch}-${Date.now()}`);
   await fs.mkdir(outDir, { recursive: true });
   if (have("unzip")) {
-    const r = spawnSync("unzip", ["-o", "-j", zipTmp, "-d", outDir], { stdio: "inherit" });
-    if (r.status !== 0) throw new Error("extract nezha-agent failed");
+    const r = await execFileAsync("unzip", ["-o", "-j", zipTmp, "-d", outDir], { timeout: 60000 });
+    if (!r.ok) throw new Error(`extract nezha-agent failed: ${r.out.slice(0, 200)}`);
   } else {
     // node >= 20: no built-in unzip; busybox/alpine images may lack unzip
     throw new Error("unzip is required to extract nezha-agent (apk add unzip)");
@@ -756,7 +872,7 @@ async function ensureNezha(cfg) {
 async function ensureKomari(cfg) {
   const arch = goArch();
   const dest = binPath(cfg, "komari");
-  if (await exists(dest)) {
+  if (await usableBinary(dest)) {
     logger.info(`node-monitor exists: ${dest}`);
     return dest;
   }
@@ -771,38 +887,50 @@ async function ensureKomari(cfg) {
 
 
 // ---- src/cert.js ----
-function haveOpenssl() {
-  try {
-    const r = spawnSync("openssl", ["version"], { stdio: "ignore" });
-    return r.status === 0;
-  } catch {
-    return false;
-  }
+async function haveOpenssl() {
+  const r = await execFileAsync("openssl", ["version"], { timeout: 10000 });
+  return r.ok;
 }
 
 /**
- * Ensure a self-signed cert for direct-udp.
+ * 直连协议共用的自签证书（vless-direct 强制校验 SNI，hy2 走 insecure）。
+ * CN/SAN 取自客户端实际使用的名字：
+ *   - 开了 vless-direct 时用 VLESS_DIRECT_SNI（默认 www.nvidia.com），与 niccore 的 server_name 一致；
+ *   - 否则用 HY2_HOST（若配了）；都拿不到时回落中性名 direct-udp。
+ * 自动探测到的公网 IP 也会一起写进 SAN（若已探测到），进一步保证客户端校验能过。
  * Returns { certPath, keyPath } or null when openssl is unavailable.
  * Cert is reused if both files already exist.
  */
-async function ensureSelfSignedCert(cfg) {
+async function ensureSelfSignedCert(cfg, opts = {}) {
   const certPath = join(cfg.binDir, ".run", "cert.pem");
   const keyPath = join(cfg.binDir, ".run", "key.pem");
   try {
     await fs.access(certPath);
     await fs.access(keyPath);
-    logger.info(`direct-udp cert reused: ${certPath}`);
+    logger.info(`direct-tls cert reused: ${certPath}`);
     return { certPath, keyPath };
   } catch {
     // need to generate
   }
-  if (!haveOpenssl()) {
-    logger.warn("openssl not found, direct-udp disabled (self-signed cert unavailable)");
+  if (!(await haveOpenssl())) {
+    logger.warn("openssl not found, direct protocols disabled (self-signed cert unavailable)");
     return null;
   }
   await fs.mkdir(join(cfg.binDir, ".run"), { recursive: true });
-  const cn = cfg.directUdpHost || "direct-udp";
-  const r = spawnSync(
+  // SAN 收集：SNI / hybrid host / 自动探测到的公网 IP / localhost
+  const sanNames = new Set();
+  const addSan = (v) => {
+    const s = String(v || "").trim();
+    if (s) sanNames.add(s);
+  };
+  if (cfg.directTcpEnabled) addSan(cfg.directTcpSni || "www.nvidia.com");
+  addSan(cfg.directUdpHost);
+  addSan(cfg.directTcpHost);
+  addSan(opts.autoHost || "");
+  const cn = [...sanNames][0] || "direct-udp";
+  const allNames = [...new Set(["localhost", ...sanNames])];
+  const sans = allNames.map((v) => (isIpv4(v) ? `IP:${v}` : `DNS:${v}`));
+  const r = await execFileAsync(
     "openssl",
     [
       "req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -810,14 +938,15 @@ async function ensureSelfSignedCert(cfg) {
       "-out", certPath,
       "-days", "3650",
       "-subj", `/CN=${cn}`,
+      "-addext", `subjectAltName=${[...new Set(sans)].join(",")}`,
     ],
-    { stdio: "inherit" }
+    { timeout: 60000 }
   );
-  if (r.status !== 0) {
-    logger.warn("openssl cert generation failed, direct-udp disabled");
+  if (!r.ok) {
+    logger.warn(`openssl cert generation failed, direct protocols disabled: ${r.out.slice(0, 200)}`);
     return null;
   }
-  logger.info(`direct-udp self-signed cert generated: ${certPath}`);
+  logger.info(`direct-tls self-signed cert generated: ${certPath} (CN=${cn})`);
   return { certPath, keyPath };
 }
 
@@ -1012,10 +1141,10 @@ function watchLinkOutput(child, onDomain) {
   return () => found;
 }
 
-/** 拨测 temp 域名是否存活：纯 HTTPS GET /（可达即活；502/503=隧道真死；超时/网络异常算死）。
+/** 拨测 temp 域名是否存活：纯 HTTPS GET /（可达即活；502/503=隧道真死；超时/网络异常算"可疑"）。
  * 注意：fetch 不允许手拼 Upgrade 头（undici 直接抛 invalid upgrade header），
  * 所以这里只能是普通 GET——它验证的是 edge 可达 + 源站有响应，足够做存活判断。 */
-async function probeTempDomain(domain, cfg, timeoutMs = 15000) {
+async function probeTempDomain(domain, timeoutMs = 15000) {
   const host = String(domain || "").replace(/^https?:\/\//, "").replace(/\/+$/, "");
   if (!host) return { ok: false, reason: "empty" };
   try {
@@ -1152,6 +1281,39 @@ function isIpv4(s) {
   return s.split(".").every((n) => Number(n) >= 0 && Number(n) <= 255);
 }
 
+/**
+ * 严格 IPv6 校验（含 :: 压缩与结尾内嵌 IPv4）。用于公网 IP 探测结果的过滤，
+ * 避免把错误页里的十六进制碎片（如 "ea"）当成地址上报。
+ */
+function isIpv6(s) {
+  if (typeof s !== "string") return false;
+  const str = s.trim();
+  if (str.length < 2 || str.length > 45) return false;
+  if (!/^[0-9a-fA-F:.]+$/.test(str)) return false;
+  if (!str.includes(":")) return false;
+  const parts = str.split("::");
+  if (parts.length > 2) return false;
+  const groups = [
+    ...(parts[0] === "" ? [] : parts[0].split(":")),
+    ...(parts.length === 2 && parts[1] !== "" ? parts[1].split(":") : []),
+  ];
+  let count = 0;
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i];
+    if (g === "") return false;
+    if (g.includes(".")) {
+      // 内嵌 IPv4 只能出现在最后一段
+      if (i !== groups.length - 1 || !isIpv4(g)) return false;
+      count += 2;
+      continue;
+    }
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return false;
+    count += 1;
+  }
+  // 有 :: 时至少压缩掉一组（因此 count <= 7）；没有 :: 时必须是完整 8 组
+  return parts.length === 2 ? count <= 7 : count === 8;
+}
+
 
 // ---- src/collectors.js ----
 /**
@@ -1225,11 +1387,25 @@ async function netCounters(iface) {
   return { rx, tx };
 }
 
+// 磁盘用量变化慢：`df` 是子进程，按 TTL 缓存，避免每个采集节拍都 fork 一次
+const DISK_CACHE_MS = 30000;
+let diskCache = { at: 0, val: null };
 async function diskInfo() {
   if (platform() !== "linux") return { total: 0, used: 0 };
+  const now = Date.now();
+  if (diskCache.val && now - diskCache.at < DISK_CACHE_MS) return diskCache.val;
   const df = await runDf();
-  if (df) return df;
-  return { total: 0, used: 0 };
+  if (df) {
+    diskCache = { at: now, val: df };
+    return df;
+  }
+  // 取失败：返回上一次的可用值，没有则 0（下次节拍会重试）
+  return diskCache.val || { total: 0, used: 0 };
+}
+
+/** 测试用：清掉磁盘缓存（模拟缓存过期/环境变化） */
+function resetDiskCache() {
+  diskCache = { at: 0, val: null };
 }
 
 function runDf() {
@@ -1401,14 +1577,112 @@ function isWholeDisk(name) {
   return true;
 }
 
-function splitHostPort(hostport, defPort) {
-  const i = hostport.lastIndexOf(":");
-  if (i === -1) return [hostport, defPort];
-  return [hostport.slice(0, i), hostport.slice(i + 1)];
+// ---- 月度流量累计（net_rx_monthly / net_tx_monthly）----
+// 面板语义："本月"累计。以 BIN_DIR/.run/traffic.json 持久化，重启后继续累加；
+// 账期由面板下发的 reset_day（1-31）决定，缺省 1 号；计数器回绕/重启后归零不会产生负数。
+// 未初始化（测试或没有 BIN_DIR）时回落到累计计数器，与原行为一致。
+const TRAFFIC_SAVE_MS = 60000;
+const trafficState = {
+  ready: false,   // loadTraffic 成功后为 true
+  primed: false,  // 首次采样只对齐基准，不把开机以来的流量算进本月
+  path: "",
+  monthKey: "",
+  base: { rx: 0, tx: 0 },
+  month: { rx: 0, tx: 0 },
+  lastSaveAt: 0,
+  saveWarned: false,
+};
+
+/**
+ * 账期键：reset_day 之前算上一个月，之后算当月（返回 "YYYY-MM"）。
+ * 用**本机时区**计算，与官方 agent（Go 的 time.Now()）语义一致；
+ * 节点时区为空时（容器默认 UTC）即等于 UTC。
+ */
+function monthKeyOf(now, resetDay) {
+  const d = new Date(now);
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const days = new Date(y, m + 1, 0).getDate();
+  const day = Math.max(1, Math.min(days, Number(resetDay) || 1));
+  const src = d.getDate() >= day ? new Date(y, m, 1) : new Date(y, m - 1, 1);
+  return `${src.getFullYear()}-${String(src.getMonth() + 1).padStart(2, "0")}`;
 }
 
-function resetCpuState() {
-  lastCpu = null;
+async function loadTraffic(cfg) {
+  if (!cfg || !cfg.binDir) return trafficState;
+  trafficState.ready = true;
+  trafficState.path = join(cfg.binDir, ".run", "traffic.json");
+  try {
+    const obj = JSON.parse(await fs.readFile(trafficState.path, "utf8"));
+    trafficState.month = {
+      rx: Math.max(0, Number(obj.month_rx) || 0),
+      tx: Math.max(0, Number(obj.month_tx) || 0),
+    };
+    trafficState.monthKey = typeof obj.month_key === "string" ? obj.month_key : "";
+  } catch (e) {
+    if (e && e.code !== "ENOENT") logger.warn(`traffic state load failed: ${e.message}`);
+    trafficState.month = { rx: 0, tx: 0 };
+    trafficState.monthKey = "";
+  }
+  return trafficState;
+}
+
+async function saveTraffic(now = Date.now()) {
+  if (!trafficState.ready || !trafficState.path) return;
+  trafficState.lastSaveAt = now;
+  try {
+    await fs.mkdir(dirname(trafficState.path), { recursive: true });
+    await fs.writeFile(
+      trafficState.path,
+      JSON.stringify({
+        month_key: trafficState.monthKey,
+        month_rx: trafficState.month.rx,
+        month_tx: trafficState.month.tx,
+        saved_at: now,
+      })
+    );
+  } catch (e) {
+    if (!trafficState.saveWarned) {
+      trafficState.saveWarned = true;
+      logger.warn(`traffic state save failed (will keep counting in memory): ${e.message}`);
+    }
+  }
+}
+
+/**
+ * 用当前累计计数器推进本月累计。
+ * 返回 { rx, tx }：本月累计（未初始化时返回传入的累计值，保持旧语义）。
+ */
+function accumulateTraffic(rx, tx, now, resetDay) {
+  if (!trafficState.ready) return { rx, tx };
+  const key = monthKeyOf(now, resetDay);
+  if (trafficState.monthKey !== key) {
+    // 跨账期（含 reset_day 触发）：清零
+    trafficState.month = { rx: 0, tx: 0 };
+    trafficState.monthKey = key;
+  }
+  if (!trafficState.primed) {
+    // 首次采样：只对齐基准。进程启动前的流量无法归因，不计入本月。
+    trafficState.primed = true;
+    trafficState.base = { rx, tx };
+    setImmediate(() => saveTraffic(Date.now()));
+    return { rx: trafficState.month.rx, tx: trafficState.month.tx };
+  }
+  const drx = rx - trafficState.base.rx;
+  const dtx = tx - trafficState.base.tx;
+  if (drx > 0) trafficState.month.rx += drx;
+  if (dtx > 0) trafficState.month.tx += dtx;
+  trafficState.base = { rx, tx };
+  if (now - trafficState.lastSaveAt > TRAFFIC_SAVE_MS) setImmediate(() => saveTraffic(Date.now()));
+  return { rx: trafficState.month.rx, tx: trafficState.month.tx };
+}
+
+/** 面板下发 rx_correction/tx_correction 时，以服务端值为本月基准 */
+function applyTrafficCorrection(rxCorr, txCorr) {
+  if (!trafficState.ready) return;
+  if (Number.isFinite(rxCorr) && rxCorr >= 0) trafficState.month.rx = Math.floor(rxCorr);
+  if (Number.isFinite(txCorr) && txCorr >= 0) trafficState.month.tx = Math.floor(txCorr);
+  setImmediate(() => saveTraffic(Date.now()));
 }
 
 
@@ -1653,6 +1927,8 @@ const WSS_PAUSE_MS = 120 * 1000;
 const WSS_NET_MIN_MS = 60 * 1000;
 const WSS_NET_MAX_MS = 5 * 60 * 1000;
 const WSS_IDLE_GRACE_MS = 15000;
+// 同一节拍内 tick() 与上报共用一份指标快照（避免每节拍两次全量采集）
+const COLLECT_REUSE_MS = 1500;
 
 function createCfProbe(cfg) {
   const state = {
@@ -1686,19 +1962,25 @@ function createCfProbe(cfg) {
     lastNet: null,
     lastIo: null,
     lastAt: 0,
+    lastMetrics: null,   // 指标快照缓存（COLLECT_REUSE_MS 内复用）
+    lastMetricsAt: 0,
     // 测速滚动窗口：每点保留近 2 分钟内最多 6 次采样，上报取中位数（对齐官方）
     probeHist: {}, // key -> [{ at, rtt, ok }]
     lastProbeAt: 0,
+    probeTimer: null,    // 后台测速定时器（start 时挂，stop 时清）
+    ipTimer: null,       // 公网 IP 刷新定时器
     lastIpAt: 0,
     lastIpv4: "",
     lastIpv6: "",
     // wss runtime
     ws: null,            // { sock, buf }
     wssConnected: false,
+    wssConnecting: false, // 握手进行中：期间 tick() 不发 POST 兜底，避免与首帧重复
     wssPausedUntil: 0,
     wssPauseReason: "",
     wssBackoffMs: WSS_NET_MIN_MS,
     wssReportAfterMs: 0, // 服务端 ack 下发的下次上报间隔（0=用默认 2s）
+    lastWssSendAt: 0,    // 上次 WSS 上报时间：首帧已由 wssConnectOnce 发出，tickLoop 不重复发
     wssLoop: null,
     wssTickLoop: null,
     wssLastConfigAt: 0,
@@ -1744,7 +2026,50 @@ function createCfProbe(cfg) {
     };
   }
 
+  /**
+   * 指标快照（同一节拍内复用）。
+   * tick()（采样）与 sendViaWss()/postOnce()（上报）都要指标，但它们通常在同一秒内发生，
+   * 过去各自 collect() 一次 → 每个节拍 2 次全量采集（含 `df` 子进程）。这里加一层短 TTL 缓存：
+   * 采样与上报共用同一份快照，指标口径也保持一致。
+   */
+  async function collectMetrics() {
+    const now = Date.now();
+    if (state.lastMetrics && now - state.lastMetricsAt < COLLECT_REUSE_MS) {
+      return state.lastMetrics;
+    }
+    const m = await collectMetricsFresh();
+    state.lastMetrics = m;
+    state.lastMetricsAt = now;
+    return m;
+  }
+
+  /** buildBody: 用快照组装上报体（时间/样本列表每次都是最新的） */
+  function buildBody(metrics, now = Date.now()) {
+    const body = {
+      id: cfg.cfNodeId,
+      secret: cfg.cfSecret,
+      time: clockSnapshot(now),
+      metrics,
+      collect_interval: effCollectInterval(),
+      report_interval: effReportInterval(),
+    };
+    // config_schema/config_md5 按官方节奏：md5 变化或每分钟至少一次
+    if (shouldReportConfigState(state.configMd5, now)) {
+      body.config_schema = CONFIG_SCHEMA;
+      body.config_md5 = state.configMd5;
+    }
+    if (state.samples.length > 0) {
+      body.samples = state.samples.map((s) => ({ ts: s.ts, metrics: s.metrics }));
+    }
+    return body;
+  }
+
+  /** 兼容入口：采集一次并组装上报体（内部调用方优先用 collectMetrics + buildBody） */
   async function collect() {
+    return buildBody(await collectMetrics());
+  }
+
+  async function collectMetricsFresh() {
     const [cpu, mem, net, disk, meta, load, boot, procs, conns, swap, io] = await Promise.all([
       cpuPercent(),
       Promise.resolve(memInfo()),
@@ -1779,7 +2104,9 @@ function createCfProbe(cfg) {
     // 测速快照来自后台滚动窗口（对齐官方 networkWorker + ProbeSnapshot）
     const snap = probeSnapshot(now);
     const targets = effProbeTargets();
-    const metrics = {
+    // 月度流量：持久化的本月累计（面板语义），未启用/失败时回落到累计计数器
+    const monthly = accumulateTraffic(net.rx, net.tx, now, effResetDay());
+    return {
       cpu: Number(cpu).toFixed(2),
       ram_total: String(mem.total),
       ram_used: String(mem.used),
@@ -1799,8 +2126,8 @@ function createCfProbe(cfg) {
       boot_time: String(calibratedBootTime(boot, now)),
       net_rx: String(net.rx),
       net_tx: String(net.tx),
-      net_rx_monthly: String(net.rx),
-      net_tx_monthly: String(net.tx),
+      net_rx_monthly: String(monthly.rx),
+      net_tx_monthly: String(monthly.tx),
       net_in_speed: String(inSpeed),
       net_out_speed: String(outSpeed),
       os: meta.os,
@@ -1831,26 +2158,6 @@ function createCfProbe(cfg) {
       loss_node_3: probeLossValue(targets.node3, snap.node3),
       loss_node_4: probeLossValue(targets.node4, snap.node4),
     };
-
-    const time = clockSnapshot(now);
-
-    const body = {
-      id: cfg.cfNodeId,
-      secret: cfg.cfSecret,
-      time,
-      metrics,
-      collect_interval: effCollectInterval(),
-      report_interval: effReportInterval(),
-    };
-    // config_schema/config_md5 按官方节奏：md5 变化或每分钟至少一次
-    if (shouldReportConfigState(state.configMd5, now)) {
-      body.config_schema = CONFIG_SCHEMA;
-      body.config_md5 = state.configMd5;
-    }
-    if (state.samples.length > 0) {
-      body.samples = state.samples.map((s) => ({ ts: s.ts, metrics: s.metrics }));
-    }
-    return body;
   }
 
   // ---- 官方探测语义 ----
@@ -1985,10 +2292,17 @@ function createCfProbe(cfg) {
         try {
           const res = await fetch(u, { headers: { "User-Agent": "curl/8.0.1" }, signal: AbortSignal.timeout(8000) });
           const text = await res.text().catch(() => "");
-          const m = ver === "v6"
-            ? text.match(/([0-9a-fA-F:]{2,45})/)
-            : text.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
-          if (m) return m[1] || m[0];
+          // 按"非 IP 字符"切分后逐段严格校验：
+          // 旧实现用宽松正则匹配（v6 只要 2 个连续 hex 就命中），错误页里的碎片也会被当成地址上报。
+          for (const raw of String(text).split(/[^0-9a-fA-F:.]+/)) {
+            const tok = raw.replace(/^\.+|\.+$/g, "");
+            if (!tok) continue;
+            if (ver === "v6") {
+              if (isIpv6(tok)) return tok;
+            } else if (isIpv4(tok)) {
+              return tok;
+            }
+          }
         } catch {}
       }
       return "";
@@ -2042,6 +2356,7 @@ function createCfProbe(cfg) {
   }
 
   // ---- 官方动态配置语义 ----
+  const dynUnknownWarned = new Set();
   const DYN_ALLOWED = new Set([
     "collect_interval", "report_interval", "wss_report_interval", "reset_day", "schema_version",
     "custom_ct", "custom_cu", "custom_cm", "custom_bd",
@@ -2057,16 +2372,29 @@ function createCfProbe(cfg) {
     let values;
     try { values = Object.fromEntries(new URLSearchParams(raw).entries()); }
     catch { return { ok: false, reason: "parse failed" }; }
+    // 未知字段：忽略并告警一次，不让一个字段把整包合法配置带下水
+    // （面板升级新增字段时，旧实现的整包 reject 会让该实例静默失去全部动态配置）
     for (const k of Object.keys(values)) {
-      if (!DYN_ALLOWED.has(k)) return { ok: false, reason: `unknown field ${k}` };
+      if (DYN_ALLOWED.has(k)) continue;
+      if (!dynUnknownWarned.has(k)) {
+        dynUnknownWarned.add(k);
+        logger.warn(`cfprobe dynamic config: unknown field ignored: ${k}`);
+      }
+      delete values[k];
     }
     const hasConfig = ["collect_interval", "report_interval", "wss_report_interval", "reset_day",
       "schema_version", "interface", "connection_mode", "ping_mode",
       "node_1", "node_2", "node_3", "node_4"].some((k) => k in values);
     if (!hasConfig) {
-      if (("rx_correction" in values) || ("tx_correction" in values) || ("update" in values)) {
-        return { ok: true, noop: true }; // 流量校正/升级确认：Node 版不支持落盘，无需处理
+      // 流量校正：以服务端下发的值为本月累计基准（其余字段无需处理）
+      if (("rx_correction" in values) || ("tx_correction" in values)) {
+        const rx = parseInt(values.rx_correction, 10);
+        const tx = parseInt(values.tx_correction, 10);
+        applyTrafficCorrection(rx, tx);
+        logger.info(`cfprobe traffic correction applied rx=${Number.isFinite(rx) ? rx : "-"} tx=${Number.isFinite(tx) ? tx : "-"}`);
+        return { ok: true, noop: true };
       }
+      if ("update" in values) return { ok: true, noop: true }; // 升级确认：Node 版无可执行动作
       return { ok: false, reason: "no config fields" };
     }
     const hex = String(md5Hex || "").toLowerCase();
@@ -2358,6 +2686,15 @@ function createCfProbe(cfg) {
   }
 
   async function wssConnectOnce() {
+    state.wssConnecting = true;
+    try {
+      return await wssConnectOnceInner();
+    } finally {
+      state.wssConnecting = false;
+    }
+  }
+
+  async function wssConnectOnceInner() {
     const wsUrl = cfWsUrl(postUrl(), CONFIG_SCHEMA, state.configMd5);
     const headers = {
       Accept: "*/*",
@@ -2557,11 +2894,13 @@ function createCfProbe(cfg) {
   async function sendViaWss() {
     if (!state.wssConnected || !state.ws) return false;
     try {
-      const body = await collect();
+      // 复用节拍内的指标快照（与 tick() 共用一次采集）
+      const metrics = await collectMetrics();
+      const body = buildBody(metrics);
       // collect 采样累积（对齐官方 samples；上报成功后清空）
       const ci = effCollectInterval();
       if (ci > 0) {
-        pushSample(clockSnapshot(Date.now()).local_ts, sampleMetrics(body.metrics));
+        pushSample(clockSnapshot(Date.now()).local_ts, sampleMetrics(metrics));
         state.lastSampleAt = Date.now();
       }
       const text = JSON.stringify(body);
@@ -2570,6 +2909,7 @@ function createCfProbe(cfg) {
       state.lastError = "";
       state.reportCount += 1;
       state.wssReports += 1;
+      state.lastWssSendAt = Date.now();
       state.samples = [];
       logger.debug(`cfprobe WSS reported #${state.reportCount}`);
       return true;
@@ -2601,11 +2941,13 @@ function createCfProbe(cfg) {
 
   async function postOnce(isFallback, skipSample) {
     try {
-      const body = await collect();
+      // 复用节拍内的指标快照（tick() 刚采集过就不重复采集）
+      const metrics = await collectMetrics();
+      const body = buildBody(metrics);
       const ci = effCollectInterval();
       // 同一节拍里 tick() 已采样过则不再重复 push，避免每个 report 塞两份样本
       if (ci > 0 && !skipSample) {
-        pushSample(clockSnapshot(Date.now()).local_ts, sampleMetrics(body.metrics));
+        pushSample(clockSnapshot(Date.now()).local_ts, sampleMetrics(metrics));
         state.lastSampleAt = Date.now();
       }
       const startedAt = Date.now();
@@ -2647,12 +2989,15 @@ function createCfProbe(cfg) {
     const ci = effCollectInterval() * 1000;
     if (ci > 0 && (!state.lastSampleAt || now - state.lastSampleAt >= ci)) {
       try {
-        const body = await collect();
-        pushSample(clockSnapshot(now).local_ts, sampleMetrics(body.metrics));
+        const m = await collectMetrics();
+        pushSample(clockSnapshot(now).local_ts, sampleMetrics(m));
         state.lastSampleAt = now;
       } catch {}
     }
     if (wssConnected) return; // WSS 节奏由 wssTickLoop 负责
+    // 握手进行中也跳过：否则会与 wssConnectOnce 的首帧、以及紧随其后的 WSS 上报重复
+    // （实测修复前启动 1 秒内会发出 WSS+POST+WSS 共 3 条完整 report）。
+    if (wssOn && state.wssConnecting) return;
     if (wssPaused()) {
       logger.debug(`POST fallback delayed reason=${state.wssPauseReason}`);
       return;
@@ -2677,12 +3022,21 @@ function createCfProbe(cfg) {
   }
 
   async function wssTickLoop() {
-    // WSS 节奏发送循环：按服务端下发的间隔发送；断连则停等重连
+    // WSS 节奏发送循环：按服务端下发的间隔发送；断连则停等重连。
+    // 注意：连接建立时的"首帧"已由 wssConnectOnce 发出，这里不能立刻再发一次，
+    // 必须等到距上次发送满一个 wss 间隔（否则启动 1 秒内会连发两条相同 report）。
     if (state.wssTickLoop) return;
     state.wssTickLoop = (async () => {
       while (state.running && useWss() && !state.wssWantStop) {
         if (!state.wssConnected || !state.ws) {
           await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        const waitMs = state.lastWssSendAt
+          ? Math.max(0, state.lastWssSendAt + wssIntervalMs() - Date.now())
+          : 0;
+        if (waitMs > 0) {
+          await new Promise((r) => setTimeout(r, waitMs));
           continue;
         }
         const ok = await sendViaWss();
@@ -2762,6 +3116,8 @@ function createCfProbe(cfg) {
     },
     // exposed for tests
     _collect: collect,
+    _collectMetrics: collectMetrics,
+    _publicIp: publicIp,
     _handleResponse: handleResponse,
     _applyDynConfig: applyDynConfig,
     _handleServerFrame: handleServerFrame,
@@ -2865,6 +3221,8 @@ class Runner {
 
   _spawn(name, bin, args, opts) {
     logger.status(`${name} starting`);
+    // debug 级记录命令行（token/secret 已脱敏），方便排查参数问题
+    logger.debug(`${name} spawn: ${redactArgs([bin, ...args]).join(" ")}`);
     // niccore 日志量大且已脱敏过滤：pipe 接住只为错误上浮，不缓存
     const child = spawn(bin, args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -2959,8 +3317,9 @@ class Runner {
     if (this.stopping) return;
     const fn = this.refetchers.get(name);
     if (!fn) {
-      // 没注册重下函数：退回普通重启（保持旧行为；bin 从重载参数里取不到就记 unknown）
-      this.scheduleRestart(name, "<unknown-bin>", args, opts, "binary missing, no refetcher");
+      // 没注册重下函数：退回普通重启（用上次 spawn 的实际 bin，避免空路径再空转一轮）
+      const prev = this.lastSpawn.get(name);
+      this.scheduleRestart(name, (prev && prev.bin) || "", args, opts, "binary missing, no refetcher");
       return;
     }
     try {
@@ -2980,9 +3339,10 @@ class Runner {
     }
   }
 
-  check(bin, args = ["version"]) {
-    const r = spawnSync(bin, args, { encoding: "utf8", timeout: 15000 });
-    return { ok: r.status === 0, out: (r.stdout || "") + (r.stderr || "") };
+  /** 二进制自检：异步执行，不阻塞事件循环（启动期用于快速失败） */
+  async check(bin, args = ["version"], timeoutMs = 15000) {
+    const r = await execFileAsync(bin, args, { timeout: timeoutMs });
+    return { ok: r.ok, out: r.out };
   }
 
   isAlive(name) {
@@ -3053,8 +3413,7 @@ function dirnameKit(p) {
 
 
 // ---- src/server.js ----
-// 静态页根目录：可执行文件旁 public/ 优先，其次 CWD/public（源码直跑），最后脚本所在目录/public
-import { dirname } from "node:path";
+// 静态页根目录：脚本所在目录下的 public/（源码与镜像布局一致）
 import { fileURLToPath } from "node:url";
 function publicDir() {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -3154,7 +3513,12 @@ function buildLinkEntry(cfg, state) {
   const host = domain.replace(/^https?:\/\//, "");
   // 代理地址用 OPT_DOMAIN（默认 staticdelivery.nexusmods.com）
   const addr = (cfg.optDomain || "").trim() || host;
-  const path = encodeURIComponent(cfg.wsPath);
+  // 段级编码：保留 "/"（个别老客户端不会把 %2F 还原成路径分隔符），
+  // 同时把 & # ? 等会破坏查询串的字符正常转义（encodeURI 不会转义这些）
+  const path = String(cfg.wsPath || "")
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
   return (
     `vless://${cfg.uuid}@${addr}:443` +
     `?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=${path}#${nodeTag(cfg, state, "vless-link")}`
@@ -3237,9 +3601,13 @@ async function main() {
     komari: cfg.komariEnabled ? "pending" : "disabled",
   };
   const getDomain = () => domain;
-  // 直连协议状态在下面第 2 步才确定；server 先挂占位闭包，启动后通过 rebind 更新
+  // server 先行规则：startServer 的闭包只能读启动前已初始化完成的状态对象
+  // （live / domainCheck / monitorState），禁止引用后置 let —— 否则下载窗口内
+  // health 请求会撞上 TDZ 直接打死进程。直连细节在下面第 2 步往 live 里填。
   const live = {
     directUdpActive: false, directTcpActive: false,
+    directUdpReason: cfg.directUdpEnabled ? "pending" : "disabled",
+    directTcpReason: cfg.directTcpEnabled ? "pending" : "disabled",
     directAutoHost: "", nodePrefix: "NODE",
   };
 
@@ -3264,12 +3632,12 @@ async function main() {
       niclink: runner.children.has("niclink"),
       direct_udp_enabled: cfg.directUdpEnabled,
       direct_udp_active: live.directUdpActive,
-      direct_udp_reason: directUdpReason,
+      direct_udp_reason: live.directUdpReason,
       direct_udp_host: (cfg.directUdpHost || "").trim() || live.directAutoHost || "",
       direct_udp_password_auto: !!cfg.directUdpPasswordAuto,
       direct_tcp_enabled: cfg.directTcpEnabled,
       direct_tcp_active: live.directTcpActive,
-      direct_tcp_reason: directTcpReason,
+      direct_tcp_reason: live.directTcpReason,
       direct_tcp_host: (cfg.directTcpHost || "").trim() || live.directAutoHost || "",
       nezha_enabled: cfg.nezhaEnabled,
       nezha_state: monitorState.nezha,
@@ -3294,6 +3662,7 @@ async function main() {
   // 1. core binaries：并行下载，server 先行，health 即时报 downloading
   dlMark("downloading", "niccore+niclink");
   await cleanTmpLeftovers(cfg);
+  await sweepStalePartials(cfg);
   const [niccoreBin, niclinkBin] = await Promise.all([
     (async () => {
       dlMark("downloading", "niccore");
@@ -3313,38 +3682,29 @@ async function main() {
 
   // 2. 直连协议：direct-udp(UDP)/direct-tcp(TCP) —— 填端口即开，密码自动派生，
   //    HOST 自动获取公网 IP，失败只警告降级，不断线。
-  //    两协议共享同一份自签 cert（tlsCert），任一开启都触发 cert 生成。
+  //    顺序：先探测端口可用性 → 再探测 HOST/国家码 → 最后生成自签证书（这样自动探测到的
+  //    公网 IP 能写进证书 SAN），两协议共享同一份 cert。
   let tlsCert = null;
-  let directUdpReason = cfg.directUdpEnabled ? "pending" : "disabled";
-  let directTcpReason = cfg.directTcpEnabled ? "pending" : "disabled";
   const needTls = cfg.directUdpEnabled || cfg.directTcpEnabled;
-  if (needTls) {
-    tlsCert = await ensureSelfSignedCert(cfg);
-    if (!tlsCert) {
-      const msg = "cert unavailable (no openssl)";
-      if (cfg.directUdpEnabled) { directUdpReason = msg; logger.warn(`direct-udp disabled: ${msg}`); }
-      if (cfg.directTcpEnabled) { directTcpReason = msg; logger.warn(`direct-tcp disabled: ${msg}`); }
-    }
-  }
-  if (tlsCert && cfg.directUdpEnabled) {
+  if (cfg.directUdpEnabled) {
     const probe = await probeUdp(cfg.directUdpPort);
     if (!probe.ok) {
-      directUdpReason = `udp-unavailable: ${probe.reason}`;
+      live.directUdpReason = `udp-unavailable: ${probe.reason}`;
       logger.warn(`direct-udp disabled: UDP :${cfg.directUdpPort} unavailable`);
     } else {
       live.directUdpActive = true;
-      directUdpReason = "active";
+      live.directUdpReason = "active";
       logger.info(`direct-udp enabled on :${cfg.directUdpPort}`);
     }
   }
-  if (tlsCert && cfg.directTcpEnabled) {
+  if (cfg.directTcpEnabled) {
     const probe = await probeTcp(cfg.directTcpPort);
     if (!probe.ok) {
-      directTcpReason = `tcp-unavailable: ${probe.reason}`;
+      live.directTcpReason = `tcp-unavailable: ${probe.reason}`;
       logger.warn(`direct-tcp disabled: TCP :${cfg.directTcpPort} unavailable`);
     } else {
       live.directTcpActive = true;
-      directTcpReason = "active";
+      live.directTcpReason = "active";
       logger.info(`direct-tcp enabled on :${cfg.directTcpPort}`);
     }
   }
@@ -3363,6 +3723,15 @@ async function main() {
   // 手动前缀非空（且非 custom）则跳过国家码请求，直接用手动值
   live.nodePrefix = nodePrefixFor(cfg, nodeCc, live.directAutoHost || cfg.directUdpHost || cfg.directTcpHost || "");
   logger.info(`node prefix: ${live.nodePrefix}`);
+  // 证书：HOST 已知后生成（SAN 带上 SNI/HOST/自动探测到的 IP）；生成失败则两个直连一起降级
+  if (needTls && (live.directUdpActive || live.directTcpActive)) {
+    tlsCert = await ensureSelfSignedCert(cfg, { autoHost: live.directAutoHost });
+    if (!tlsCert) {
+      const msg = "cert unavailable (no openssl)";
+      if (cfg.directUdpEnabled) { live.directUdpActive = false; live.directUdpReason = msg; logger.warn(`direct-udp disabled: ${msg}`); }
+      if (cfg.directTcpEnabled) { live.directTcpActive = false; live.directTcpReason = msg; logger.warn(`direct-tcp disabled: ${msg}`); }
+    }
+  }
   // niccore 只装配真正 active 的协议：cert 有但端口被占的，不进 config
   const sbTls = (live.directUdpActive || live.directTcpActive) ? tlsCert : null;
   if (cfg.directUdpEnabled && !live.directUdpActive) cfg.directUdpEnabled = false;
@@ -3370,12 +3739,40 @@ async function main() {
 
   // 3. niccore config（配置由本程序生成，JSON 写盘即校验，不再 spawn check 子进程）
   const sbPath = await writeSingBoxConfig(cfg, ".", sbTls);
-  // niclink 启动前做一次快速自检：二进制若缺依赖/坏包会在此直接暴露，
-  // 避免 Runner 把启动即崩当成普通退出无限重启（30 次上限刷屏）
-  const linkChk = runner.check(niclinkBin, ["run", "--help"]);
+
+  /**
+   * 启动自检：二进制坏包（半截下载、磁盘损坏、架构不匹配）在这里暴露。
+   * 坏包若直接交给 Runner，会表现为"启动即崩"，一路退避到 30 次上限后放弃，
+   * 期间永远不会重新下载。这里先自检一次：失败则删掉重下一次再试，仍失败才退出。
+   */
+  async function selfCheckOrRefetch(name, bin, args, refetch) {
+    let cur = bin;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const chk = await runner.check(cur, args);
+      if (chk.ok) return { ok: true, bin: cur };
+      logger.warn(`${name} self-check failed (attempt ${attempt + 1}): ${chk.out.slice(0, 200)}`);
+      if (attempt === 1) return { ok: false, bin: cur, out: chk.out };
+      await fs.rm(cur, { force: true }).catch(() => {});
+      try {
+        cur = await refetch();
+        markFreshBinary(cur);
+      } catch (e) {
+        return { ok: false, bin: cur, out: `re-download failed: ${e.message}` };
+      }
+    }
+    return { ok: false, bin: cur, out: "unknown" };
+  }
+
+  const coreChk = await selfCheckOrRefetch("niccore", niccoreBin, ["run", "--help"], () => ensureNiccore(cfg));
+  if (!coreChk.ok) {
+    logger.status(`niccore failed: self-check failed, aborting`);
+    logger.error(`niccore self-check failed, aborting (not restarting):\n${String(coreChk.out).slice(0, 2000)}`);
+    process.exit(1);
+  }
+  const linkChk = await selfCheckOrRefetch("niclink", niclinkBin, ["run", "--help"], () => ensureNiclink(cfg));
   if (!linkChk.ok) {
     logger.status(`niclink failed: self-check failed, aborting`);
-    logger.error(`niclink self-check failed, aborting (not restarting):\n${linkChk.out.slice(0, 2000)}`);
+    logger.error(`niclink self-check failed, aborting (not restarting):\n${String(linkChk.out).slice(0, 2000)}`);
     process.exit(1);
   }
 
@@ -3385,7 +3782,7 @@ async function main() {
     markFreshBinary(fresh);
     return fresh;
   });
-  runner.start("niccore", niccoreBin, ["run", "-c", sbPath]);
+  runner.start("niccore", coreChk.bin, ["run", "-c", sbPath]);
 
   // 5. start niclink（注册 TTL 缺二进制重下；启动即崩则快速失败，不进 30 次重启）
   runner.onMissingBinary("niclink", async () => {
@@ -3393,7 +3790,7 @@ async function main() {
     markFreshBinary(fresh);
     return fresh;
   });
-  const t = buildLinkArgs(cfg, niclinkBin);
+  const t = buildLinkArgs(cfg, linkChk.bin);
   const linkBirthMs = Date.now();
   // kit 状态闭包提前定义：onTempDomain（域名变更即重写）与定时 tick 共用
   const kitState = {
@@ -3480,6 +3877,8 @@ async function main() {
       logger.warn(`komari-agent disabled: ${e.message}`);
     }
   }
+  // 月度流量状态：持久化文件读取（失败只在内部告警，不影响启动）
+  await loadTraffic(cfg);
   if (cfg.cfEnabled) {
     cfProbe = createCfProbe(cfg);
     cfProbe.start();
@@ -3503,7 +3902,7 @@ async function main() {
   if (cfg.atLinkMode === "temp") {
     const domainTick = async () => {
       if (!domain || !runner.isAlive("niclink")) return; // 未就绪/重建中：跳过
-      const r = await probeTempDomain(domain, cfg);
+      const r = await probeTempDomain(domain);
       domainCheck.at = new Date().toISOString();
       if (r.ok) {
         if (domainCheck.ok === false) logger.status(`niclink ok: domain reachable again (${r.reason})`);
@@ -3515,8 +3914,12 @@ async function main() {
       domainCheck.ok = false;
       domainCheck.reason = r.reason;
       domainCheck.fails += 1;
-      logger.status(`niclink warn: domain check failed #${domainCheck.fails} (${r.reason})`);
-      if (domainCheck.fails >= 2) {
+      // edge 明确回 502/503 才算"隧道真死"（2 次重启）；超时/DNS 抖动等网络类
+      // 失败容错到 3 次，避免网络抖动或本地出网问题时主动掐掉还能用的隧道。
+      const hardDead = /^http=50[23]$/.test(String(r.reason || ""));
+      const need = hardDead ? 2 : 3;
+      logger.status(`niclink warn: domain check failed #${domainCheck.fails}/${need} (${r.reason})`);
+      if (domainCheck.fails >= need) {
         logger.status(`niclink restarting: domain dead, fetching fresh domain`);
         domainCheck.fails = 0;
         domain = null; // 清掉旧值：/kit 立刻回占位行，避免吐出已死的旧链接
@@ -3545,4 +3948,28 @@ if (process.env.NIC_SKIP_MAIN !== "1") {
   });
 }
 
-export { loadConfig, createCfProbe, Runner, checkSubAuth, wsFrameEncode, wsFrameDecodeOne, probeTempDomain, isWholeDisk, MAX_RESTARTS, RESTART_RESET_MS };
+export {
+  loadConfig,
+  createCfProbe,
+  Runner,
+  checkSubAuth,
+  buildSubEntries,
+  downloadFile,
+  usableBinary,
+  sweepStalePartials,
+  MIN_SANE_BIN,
+  wsFrameEncode,
+  wsFrameDecodeOne,
+  probeTempDomain,
+  isWholeDisk,
+  isIpv4,
+  isIpv6,
+  resetDiskCache,
+  monthKeyOf,
+  loadTraffic,
+  saveTraffic,
+  accumulateTraffic,
+  trafficState,
+  MAX_RESTARTS,
+  RESTART_RESET_MS,
+};

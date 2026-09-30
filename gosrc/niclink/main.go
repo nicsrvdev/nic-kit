@@ -22,7 +22,10 @@ var (
 )
 
 func main() {
-	os.Setenv("QUIC_GO_DISABLE_ECN", "1")
+	// QUIC ECN 兼容性兜底：仅在用户未显式设置时启用（显式设置 =0 时尊重用户选择）
+	if _, ok := os.LookupEnv("QUIC_GO_DISABLE_ECN"); !ok {
+		os.Setenv("QUIC_GO_DISABLE_ECN", "1")
+	}
 
 	buildInfo = cliutil.GetBuildInfo(BuildType, Version)
 

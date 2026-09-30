@@ -656,10 +656,24 @@
   });
 
   // ========== UUID ==========
+  // UUID 会直接当作 vless 凭据（共享密钥）使用，必须用 CSPRNG 生成：
+  // Math.random 的状态可从少量输出反推，生成的凭据可预测。
+  // 注意 crypto.randomUUID 仅在安全上下文可用（本页常经 http://IP:3000 访问），
+  // 所以走 crypto.getRandomValues（非安全上下文也可用）自行拼 v4。
   function uuidv4() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const c = (typeof crypto !== 'undefined') ? crypto : null;
+    if (c && typeof c.getRandomValues === 'function') {
+      const b = new Uint8Array(16);
+      c.getRandomValues(b);
+      b[6] = (b[6] & 0x0f) | 0x40; // version 4
+      b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+      const hex = [...b].map(x => x.toString(16).padStart(2, '0'));
+      return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10, 16).join('')}`;
+    }
+    console.warn('crypto.getRandomValues 不可用，回退到 Math.random（随机性较弱）');
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, ch => {
       const r = Math.random() * 16 | 0;
-      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      const v = ch === 'x' ? r : (r & 0x3 | 0x8);
       return v.toString(16);
     });
   }
@@ -814,19 +828,51 @@
     }, 30);
   }
 
+  // Clipboard API 只在安全上下文（https / localhost）可用，本页常经 http://IP:3000 访问，
+  // 此时 navigator.clipboard 是 undefined，直接调用会抛 TypeError 且没有任何反馈。
+  // 这里统一走带降级的复制函数：优先 Clipboard API，失败退回 execCommand。
+  function writeClipboard(text) {
+    const fallback = () => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-1000px';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch (e) {
+        return false;
+      }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(() => true).catch(() => fallback());
+    }
+    return Promise.resolve(fallback());
+  }
+
   function copyObfuscated() {
     const text = document.getElementById('jsOutput').value;
     if (!text) {
       showToast('没有可复制的内容');
       return;
     }
-    navigator.clipboard.writeText(text).then(() => showToast('已复制混淆结果'));
+    writeClipboard(text).then(ok => showToast(ok ? '已复制混淆结果' : '复制失败，请手动选中复制'));
   }
 
   // ========== 通用 ==========
   function copyText(btn, text) {
     if (!text || text === '点击上方按钮生成') return;
-    navigator.clipboard.writeText(text).then(() => {
+    writeClipboard(text).then(ok => {
+      if (!ok) {
+        showToast('复制失败，请手动选中复制');
+        return;
+      }
       btn.textContent = '已复制';
       btn.classList.add('copied');
       setTimeout(() => {
