@@ -90,6 +90,20 @@ test("降噪：三条真实的 niccore 错误行被判为噪音（含 ANSI 色�
   assert.match(linkNoise.lastAt, /^\d{4}-\d{2}-\d{2}T/);
 });
 
+test("降噪：niccore 方括号 IPv6 源地址（EOF / bad path / 握手错误）全部匹配并计数", () => {
+  const lines = [
+    "\u001b[31mERROR\u001b[0m[0047] [\u001b[38;5;32m2931006700\u001b[0m 250ms] inbound/vless[vless-link]: process connection from [2001:df1:801:a022::359:e]:55096: EOF",
+    "ERROR[0048] [2836666548 18ms] inbound/vless[vless-link]: process connection from [2001:db8::1]:44716: bad path: /",
+    "ERROR[0049] [710694666 243ms] inbound/vless[vless-link]: process connection from [fe80::1%eth0]:55340: upgrade websocket connection: handshake error: bad \"Upgrade\" header",
+  ];
+  const before = linkNoise.count;
+  for (const line of lines) {
+    assert.equal(isLinkInboundNoise(line), true, line);
+  }
+  assert.equal(linkNoise.count, before + lines.length, "IPv6 的 EOF / bad path / 握手错误都应降噪并计数");
+  assert.match(linkNoise.lastAt, /^\d{4}-\d{2}-\d{2}T/);
+});
+
 test("降噪：真正的故障行不受影响（不能被误吞）", () => {
   const keep = [
     "FATAL error: listen udp 0.0.0.0:4433: bind: address already in use",
@@ -100,6 +114,8 @@ test("降噪：真正的故障行不受影响（不能被误吞）", () => {
     // 端口缺失的畸形行不匹配（说明日志格式变了，宁可多报也不要漏报）
     "inbound/v[link]: process connection from 1.2.3.4: bad path: /",
     "inbound/vless[vless-link]: process connection from 1.2.3.4:80: vless: unexpected version 0",
+    // 完整行尾部还有其它错误信息时不能因为前缀像 EOF 噪音而被误吞（正则必须锚定行尾）
+    "inbound/vless[vless-link]: process connection from 1.2.3.4:80: EOF; unexpected transport failure",
   ];
   for (const l of keep) assert.equal(isLinkInboundNoise(l), false, l);
 });

@@ -636,7 +636,7 @@ function scheduleBinaryTtl(cfg) {
     for (const f of [...__freshBins]) {
       try {
         await fs.rm(f, { force: true });
-        logger.warn(`[OK] binary ttl removed: ${f}`);
+        logger.info(`[OK] binary ttl removed: ${f}`);
       } catch (e) {
         logger.warn(`binary ttl remove failed (${f}): ${e.message}`);
       }
@@ -3454,10 +3454,11 @@ class Runner {
 // 这是逐连接噪音而不是故障（拨测本身靠它拿到 404/400 判活）。默认降到 debug，
 // 同时计数，/health 里以 link_bad_requests 暴露；要逐条看把 LOG_LEVEL=debug 即可。
 const linkNoise = { count: 0, lastAt: "" };
-// 注意：不加 $ 锚定 —— niccore 的日志是"按块"送来的，一个 chunk 里可能还有后续行，
-// 锚定行尾会漏判。
+// makeLineSplitter 已保证这里收到的是完整日志行，因此锚定行尾，避免把带额外错误文本的行误吞。
+// 来源地址既可能是 IPv4/主机名，也可能是 Go net 包方括号包裹的 IPv6
+//（如 `[2001:db8::1]:55096`）；IPv6 的冒号必须作为地址的一部分接受，地址匹配须显式支持方括号。
 const LINK_NOISE_RE =
-  /inbound\/v\[link\]: process connection from [^\s:]+:\d+: (EOF|bad path: \S*|upgrade websocket connection: handshake error[^\r\n]*)/;
+  /inbound\/v\[link\]: process connection from (?:\[[^\]\s]+\]|[^\s:]+):\d+: (EOF|bad path: \S*|upgrade websocket connection: handshake error[^\r\n]*)$/;
 function isLinkInboundNoise(line) {
   // 关键：niccore 原始输出是 `inbound/vless[vless-link]: ...`，
   // 日志展示层 cleanLog 才会把它中性化成 `inbound/v[link]: ...`。
