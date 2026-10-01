@@ -508,7 +508,8 @@ async function resolveTag(repo, pinned, fallback, ghToken = "") {
 const __haveCache = new Map();
 function have(cmd) {
   if (__haveCache.has(cmd)) return __haveCache.get(cmd);
-  const ok = spawnSync("sh", ["-c", `command -v ${cmd} >/dev/null 2>&1`], { stdio: "ignore" }).status === 0;
+  // 不把 cmd 拼进 shell 字符串：位置参数传值，避免"以后有人传变量进来"时变成命令注入
+  const ok = spawnSync("sh", ["-c", 'command -v -- "$1" >/dev/null 2>&1', "sh", String(cmd)], { stdio: "ignore" }).status === 0;
   __haveCache.set(cmd, ok);
   return ok;
 }
@@ -1148,6 +1149,31 @@ function buildLinkArgs(cfg, binPath) {
   };
 }
 
+/** 流式分行器：一个 chunk 里只把"以换行结束"的部分当完整行回调，
+ *  末尾残行留到下一个 chunk 拼回来再处理 —— 管道按 64KB 分块、与行边界无关，
+ *  行被切开时若不补：噪音行会以"残行"形式漏成 WARN（计数器还漏计），真错误也会被打成两段。
+ *  残行超过 maxTail 时只保留最后 maxTail 字符，防"无换行畸形数据"把内存撑爆。 */
+function makeLineSplitter(onLine, maxTail = 8192) {
+  let tail = "";
+  return {
+    push(chunk) {
+      const raw = tail + String(chunk);
+      const parts = raw.split(/\r?\n/);
+      tail = parts.pop();
+      if (tail.length > maxTail) tail = tail.slice(-maxTail);
+      for (const p of parts) {
+        const line = p.trim();
+        if (line) onLine(line);
+      }
+    },
+    flush() {
+      const line = tail.trim();
+      tail = "";
+      if (line) onLine(line);
+    },
+  };
+}
+
 /** Extract https://xxx.trycloudflare.com from niclink log line. */
 function parseTempDomain(line) {
   const m = String(line).match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
@@ -1158,11 +1184,16 @@ function watchLinkOutput(child, onDomain) {
   // 注意：每次 niclink spawn（含 Runner 重启）都要重新绑一次；
   // 新域名出现即回调（同一进程内只认第一个，不同进程可更新）。
   // 拿到域名后解绑 scan，只留 Runner 的轻量 onChunk，避免双份字符串拷贝。
+  // 域名横幅不保证整个 URL 落在同一个 chunk 里（管道按 64KB 分块，与行无关）：
+  // 只按单块匹配时，跨块的 URL 会永远扫不到 → 临时域名丢失（正是这个函数的核心职责）。
+  // 用 4KB 尾部滚动缓冲拼回后再匹配。
   let found = null;
+  let buf = "";
   const scan = (data) => {
-    const text = String(data);
-    if (!found) {
-      const d = parseTempDomain(text);
+    if (found) return;
+    buf = (buf + String(data)).slice(-4096);
+    {
+      const d = parseTempDomain(buf);
       if (d) {
         found = d;
         logger.info(`link temp domain: ${d}`);
@@ -1893,6 +1924,7 @@ function wsConnect(rawWsUrl, extraHeaders, timeoutMs) {
     const fail = (e) => {
       if (settled) return;
       settled = true;
+      try { clearTimeout(timer); } catch {}
       try { sock && sock.destroy(); } catch {}
       reject(e);
     };
@@ -3282,25 +3314,26 @@ class Runner {
       stdio: ["ignore", "pipe", "pipe"],
       ...opts,
     });
-    const onChunk = (d) => {
-      // 分块到达即处理，不累积；按行拆分逐行判定（一个 chunk 里可能混着多行，
-      // 混着"噪音 + 真错误"时不能整块吞掉），单行截断 500/300 字符
-      const raw = String(d);
-      const head = raw.length > 2000 ? raw.slice(0, 2000) : raw;
-      for (const rawLine of head.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        logger.debug(`[${name}] ${line}`);
-        // niccore 的"非 vless 连接"噪音（含我们自己的存活拨测）降到 debug 并计数
-        if (name === "niccore" && isLinkInboundNoise(line)) continue;
-        if (/ERR|error|panic|failed|Couldn't/i.test(line)) {
-          logger.warn(`[${name}] ${line.length > 300 ? line.slice(0, 300) : line}`);
-        }
+    // 按"完整行"处理：残行留到下一个 chunk 拼回（见 makeLineSplitter 注释）。
+    const handleLine = (line) => {
+      logger.debug(`[${name}] ${line.length > 2000 ? line.slice(0, 2000) + " …" : line}`);
+      // niccore 的"非 vless 连接"噪音（含我们自己的存活拨测）降到 debug 并计数
+      if (name === "niccore" && isLinkInboundNoise(line)) return;
+      if (/ERR|error|panic|failed|Couldn't/i.test(line)) {
+        logger.warn(`[${name}] ${line.length > 300 ? line.slice(0, 300) : line}`);
       }
     };
-    child.stdout && child.stdout.on("data", onChunk);
+    // stdout / stderr 各自独立缓冲：两条流交叉到达时不能互相污染残行
+    const outSplit = makeLineSplitter(handleLine);
+    const errSplit = makeLineSplitter(handleLine);
+    child.stdout && child.stdout.on("data", (d) => outSplit.push(d));
     // stderr 同 stdout 合并处理；域名监听拿到首个域名后自动解绑
-    child.stderr && child.stderr.on("data", onChunk);
+    child.stderr && child.stderr.on("data", (d) => errSplit.push(d));
+    // 进程退出时把最后一段没有换行结尾的日志也吐出来（否则会被丢掉）
+    child.on("exit", () => {
+      try { outSplit.flush(); } catch {}
+      try { errSplit.flush(); } catch {}
+    });
     this.children.set(name, child);
     this.spawnedAt.set(name, Date.now());
     // spawn 钩子：每次（含重启）都触发，调用方自行挂监听
@@ -4038,9 +4071,11 @@ async function main() {
         runner.restart("niclink", "domain dead, fetching fresh domain"); // 显式重启：stop() 的 exit 会被 stale guard 拦，不能靠它
       }
     };
-    const domainTimer = setInterval(domainTick, 60000);
+    // 与其他定时器一致地兜住异常：setInterval/setTimeout 的 async 回调一旦 reject，
+    // 未处理的 Promise 拒绝在 Node ≥15 默认直接终止进程（面板里就是一次"崩溃重启"）。
+    const domainTimer = setInterval(() => { domainTick().catch((e) => logger.debug(`domain check error: ${e && e.message}`)); }, 60000);
     if (domainTimer.unref) domainTimer.unref();
-    const domainOnce = setTimeout(domainTick, 45000); // 首次 45s（错开 kit.txt 的 15s）
+    const domainOnce = setTimeout(() => { domainTick().catch(() => {}); }, 45000); // 首次 45s（错开 kit.txt 的 15s）
     if (domainOnce.unref) domainOnce.unref();
   }
 
@@ -4062,6 +4097,9 @@ if (process.env.NIC_SKIP_MAIN !== "1") {
 export {
   loadConfig,
   parseRequestUrl,
+  makeLineSplitter,
+  watchLinkOutput,
+  parseTempDomain,
   isLinkInboundNoise,
   linkNoise,
   writeFileAtomic,
