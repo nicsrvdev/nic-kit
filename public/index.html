@@ -1,12 +1,10 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DevTools · UUID 生成 & JS 混淆</title>
-<!-- CDN 优先，失败/被篡改（SRI 不匹配）时自动回退本地同目录文件。
-     注意：@4.3.0 这个版本 npm 上并不存在（CDN 一直 404），已修正为与本地
-     vendor 包逐字节一致的 5.8.0，并用 integrity 锁定哈希。 -->
+<title>DevTools · UUID Generator &amp; JS Obfuscator</title>
+<!-- 混淆引擎：CDN 优先加载并以 SRI 锁定哈希，失败时自动回退本地同目录文件。 -->
 <script src="https://cdn.jsdelivr.net/npm/javascript-obfuscator@5.8.0/dist/index.browser.js"
         integrity="sha384-7mxzS3M1M8D0Tolaot1E9Eem228SIuZdu6zfFZyIAJ9zmgilz3SnxvqDRbJJRm06"
         crossorigin="anonymous"></script>
@@ -85,10 +83,19 @@
   .logo {
     font-weight: 700;
     font-size: 1.25rem;
-    background: linear-gradient(135deg, var(--accent), var(--accent2));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    color: var(--accent2);
     letter-spacing: -0.5px;
+  }
+  /* 渐变字只在确认支持 background-clip:text 时启用；否则用上面的纯色兜底，
+     避免 text-fill-color:transparent 在裁剪不生效的环境里把字变全透明。 */
+  @supports ((-webkit-background-clip: text) or (background-clip: text)) {
+    .logo {
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      color: transparent;
+    }
   }
   .nav-links { display: flex; gap: 28px; }
   .nav-links a {
@@ -120,9 +127,16 @@
     font-weight: 800;
     letter-spacing: -1.5px;
     margin-bottom: 16px;
-    background: linear-gradient(135deg, #fff 30%, var(--accent2) 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    color: var(--text);
+  }
+  @supports ((-webkit-background-clip: text) or (background-clip: text)) {
+    .hero h1 {
+      background: linear-gradient(135deg, #fff 30%, var(--accent2) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      color: transparent;
+    }
   }
   .hero p {
     color: var(--muted);
@@ -433,18 +447,18 @@
     <nav class="nav">
       <div class="logo">DevTools</div>
       <div class="nav-links">
-        <a href="#tools">工具</a>
-        <a href="#bookmarks">书签</a>
-        <a href="#about">关于</a>
+        <a href="#tools" data-i18n="navTools">Tools</a>
+        <a href="#bookmarks" data-i18n="navBookmarks">Bookmarks</a>
+        <a href="#about" data-i18n="navAbout">About</a>
       </div>
     </nav>
   </header>
 
   <main>
     <section class="hero">
-      <div class="hero-badge">🔒 服务端加载 · 专业级混淆 · 零上传</div>
-      <h1>UUID 生成 & 专业 JS 混淆</h1>
-      <p>混淆引擎优先从 CDN 加载，失败时自动回退服务端本地文件；支持控制流平坦化、字符串加密、死代码注入等专业能力，同时保留精选书签导航。</p>
+      <div class="hero-badge" data-i18n="heroBadge">🔒 Server-loaded · Pro-grade obfuscation · Zero upload</div>
+      <h1 data-i18n="heroTitle">UUID Generator &amp; Pro JS Obfuscator</h1>
+      <p data-i18n="heroDesc">The obfuscation engine loads from the CDN first and falls back to the local server copy automatically. Control flow flattening, string encryption, dead code injection and more — plus a curated bookmark collection.</p>
     </section>
 
     <section id="tools" class="tools-grid">
@@ -453,19 +467,19 @@
         <div class="tool-header">
           <div class="tool-icon">🔑</div>
           <div>
-            <h2>UUID 生成器</h2>
+            <h2 data-i18n="uuidTitle">UUID Generator</h2>
             <span>RFC 4122 · Version 4</span>
           </div>
         </div>
         <div class="uuid-controls">
-          <button class="btn btn-primary" onclick="generateUUIDs()">生成 UUID</button>
-          <button class="btn btn-secondary" onclick="generateUUIDs(5)">批量 ×5</button>
-          <button class="btn btn-secondary" onclick="clearUUIDs()">清空</button>
+          <button class="btn btn-primary" onclick="generateUUIDs()" data-i18n="btnGenerate">Generate UUID</button>
+          <button class="btn btn-secondary" onclick="generateUUIDs(5)" data-i18n="btnBatch">Batch ×5</button>
+          <button class="btn btn-secondary" onclick="clearUUIDs()" data-i18n="btnClear">Clear</button>
         </div>
         <div class="uuid-list" id="uuidList">
           <div class="uuid-item">
-            <code id="firstUuid">点击上方按钮生成</code>
-            <button class="copy-btn" onclick="copyText(this, document.getElementById('firstUuid').textContent)">复制</button>
+            <code id="firstUuid" data-i18n="uuidHint">Click a button above to generate</code>
+            <button class="copy-btn" data-i18n="copy" onclick="copyText(this, document.getElementById('firstUuid').textContent)">Copy</button>
           </div>
         </div>
       </div>
@@ -475,188 +489,355 @@
         <div class="tool-header">
           <div class="tool-icon">🛡️</div>
           <div>
-            <h2>专业 JS 混淆</h2>
-            <span>javascript-obfuscator 本地引擎</span>
+            <h2 data-i18n="obfTitle">Pro JS Obfuscator</h2>
+            <span data-i18n="obfSub">javascript-obfuscator local engine</span>
           </div>
         </div>
 
         <div class="obf-controls">
-          <button class="btn btn-preset active" data-preset="low" onclick="setPreset('low')">低强度</button>
-          <button class="btn btn-preset" data-preset="medium" onclick="setPreset('medium')">中等</button>
-          <button class="btn btn-preset" data-preset="high" onclick="setPreset('high')">高强度</button>
-          <button class="btn btn-primary" onclick="runObfuscate()">开始混淆</button>
-          <button class="btn btn-secondary btn-sm" onclick="copyObfuscated()">复制结果</button>
+          <button class="btn btn-preset active" data-preset="low" onclick="setPreset('low')" data-i18n="presetLow">Low</button>
+          <button class="btn btn-preset" data-preset="medium" onclick="setPreset('medium')" data-i18n="presetMedium">Medium</button>
+          <button class="btn btn-preset" data-preset="high" onclick="setPreset('high')" data-i18n="presetHigh">High</button>
+          <button class="btn btn-primary" onclick="runObfuscate()" data-i18n="btnObfuscate">Obfuscate</button>
+          <button class="btn btn-secondary btn-sm" onclick="copyObfuscated()" data-i18n="btnCopyResult">Copy result</button>
         </div>
 
         <div class="obf-options">
-          <label class="checkbox"><input type="checkbox" id="optCompact" checked> 压缩</label>
-          <label class="checkbox"><input type="checkbox" id="optControlFlow"> 控制流平坦化</label>
-          <label class="checkbox"><input type="checkbox" id="optDeadCode"> 死代码注入</label>
-          <label class="checkbox"><input type="checkbox" id="optStringArray" checked> 字符串数组</label>
-          <label class="checkbox"><input type="checkbox" id="optStringEncode"> 字符串加密</label>
-          <label class="checkbox"><input type="checkbox" id="optSelfDefending"> 自我保护</label>
-          <label class="checkbox"><input type="checkbox" id="optRenameGlobals"> 重命名全局</label>
-          <label class="checkbox"><input type="checkbox" id="optNumbersToExpr"> 数字转表达式</label>
+          <label class="checkbox"><input type="checkbox" id="optCompact" checked> <span data-i18n="optCompact">Compact</span></label>
+          <label class="checkbox"><input type="checkbox" id="optControlFlow"> <span data-i18n="optControlFlow">Control flow flattening</span></label>
+          <label class="checkbox"><input type="checkbox" id="optDeadCode"> <span data-i18n="optDeadCode">Dead code injection</span></label>
+          <label class="checkbox"><input type="checkbox" id="optStringArray" checked> <span data-i18n="optStringArray">String array</span></label>
+          <label class="checkbox"><input type="checkbox" id="optStringEncode"> <span data-i18n="optStringEncode">String encryption</span></label>
+          <label class="checkbox"><input type="checkbox" id="optSelfDefending"> <span data-i18n="optSelfDefending">Self defending</span></label>
+          <label class="checkbox"><input type="checkbox" id="optRenameGlobals"> <span data-i18n="optRenameGlobals">Rename globals</span></label>
+          <label class="checkbox"><input type="checkbox" id="optNumbersToExpr"> <span data-i18n="optNumbersToExpr">Numbers to expressions</span></label>
         </div>
 
-        <textarea id="jsInput" placeholder="粘贴你的 JavaScript 代码..."></textarea>
+        <textarea id="jsInput" data-i18n-ph="phInput" placeholder="Paste your JavaScript code..."></textarea>
         <div class="obf-stats" id="obfStats"></div>
-        <textarea id="jsOutput" placeholder="混淆结果将显示在这里..." readonly></textarea>
+        <textarea id="jsOutput" data-i18n-ph="phOutput" placeholder="Obfuscated result will appear here..." readonly></textarea>
         <div class="status-bar" id="statusBar"></div>
       </div>
     </section>
 
     <!-- 书签 -->
     <section id="bookmarks" class="bookmarks">
-      <h2 class="section-title">精选书签</h2>
+      <h2 class="section-title" data-i18n="bmSection">Curated Bookmarks</h2>
 
       <div class="category">
-        <h3>🛠 开发工具</h3>
+        <h3 data-i18n="catDev">🛠 Dev Tools</h3>
         <div class="bookmark-grid">
           <a class="bookmark-card" href="https://github.com" target="_blank" rel="noopener">
             <div class="bm-icon">🐙</div>
             <div class="bm-name">GitHub</div>
-            <div class="bm-desc">代码托管与协作</div>
+            <div class="bm-desc" data-i18n="bmGithub">Code hosting &amp; collaboration</div>
           </a>
           <a class="bookmark-card" href="https://codepen.io" target="_blank" rel="noopener">
             <div class="bm-icon">🖊️</div>
             <div class="bm-name">CodePen</div>
-            <div class="bm-desc">前端沙盒实验</div>
+            <div class="bm-desc" data-i18n="bmCodepen">Front-end sandbox</div>
           </a>
           <a class="bookmark-card" href="https://stackoverflow.com" target="_blank" rel="noopener">
             <div class="bm-icon">📚</div>
             <div class="bm-name">Stack Overflow</div>
-            <div class="bm-desc">程序员问答社区</div>
+            <div class="bm-desc" data-i18n="bmStackoverflow">Programming Q&amp;A community</div>
           </a>
           <a class="bookmark-card" href="https://caniuse.com" target="_blank" rel="noopener">
             <div class="bm-icon">📊</div>
             <div class="bm-name">Can I Use</div>
-            <div class="bm-desc">浏览器兼容性查询</div>
+            <div class="bm-desc" data-i18n="bmCaniuse">Browser compatibility tables</div>
           </a>
           <a class="bookmark-card" href="https://regex101.com" target="_blank" rel="noopener">
             <div class="bm-icon">🔍</div>
             <div class="bm-name">Regex101</div>
-            <div class="bm-desc">正则表达式调试</div>
+            <div class="bm-desc" data-i18n="bmRegex101">Regex debugger</div>
           </a>
           <a class="bookmark-card" href="https://jsonformatter.org" target="_blank" rel="noopener">
             <div class="bm-icon">📋</div>
             <div class="bm-name">JSON Formatter</div>
-            <div class="bm-desc">JSON 格式化工具</div>
+            <div class="bm-desc" data-i18n="bmJsonfmt">JSON formatting tool</div>
           </a>
         </div>
       </div>
 
       <div class="category">
-        <h3>🎨 设计灵感</h3>
+        <h3 data-i18n="catDesign">🎨 Design Inspiration</h3>
         <div class="bookmark-grid">
           <a class="bookmark-card" href="https://dribbble.com" target="_blank" rel="noopener">
             <div class="bm-icon">🏀</div>
             <div class="bm-name">Dribbble</div>
-            <div class="bm-desc">设计师作品展示</div>
+            <div class="bm-desc" data-i18n="bmDribbble">Designer portfolio showcase</div>
           </a>
           <a class="bookmark-card" href="https://www.figma.com" target="_blank" rel="noopener">
             <div class="bm-icon">✏️</div>
             <div class="bm-name">Figma</div>
-            <div class="bm-desc">协作式设计工具</div>
+            <div class="bm-desc" data-i18n="bmFigma">Collaborative design tool</div>
           </a>
           <a class="bookmark-card" href="https://coolors.co" target="_blank" rel="noopener">
             <div class="bm-icon">🎨</div>
             <div class="bm-name">Coolors</div>
-            <div class="bm-desc">配色方案生成</div>
+            <div class="bm-desc" data-i18n="bmCoolors">Color palette generator</div>
           </a>
           <a class="bookmark-card" href="https://fonts.google.com" target="_blank" rel="noopener">
             <div class="bm-icon">🔤</div>
             <div class="bm-name">Google Fonts</div>
-            <div class="bm-desc">免费网页字体</div>
+            <div class="bm-desc" data-i18n="bmGfonts">Free web fonts</div>
           </a>
           <a class="bookmark-card" href="https://www.awwwards.com" target="_blank" rel="noopener">
             <div class="bm-icon">🏆</div>
             <div class="bm-name">Awwwards</div>
-            <div class="bm-desc">优秀网页设计奖</div>
+            <div class="bm-desc" data-i18n="bmAwwwards">Web design awards</div>
           </a>
         </div>
       </div>
 
       <div class="category">
-        <h3>🤖 AI & 效率</h3>
+        <h3 data-i18n="catAi">🤖 AI &amp; Productivity</h3>
         <div class="bookmark-grid">
           <a class="bookmark-card" href="https://chat.openai.com" target="_blank" rel="noopener">
             <div class="bm-icon">💬</div>
             <div class="bm-name">ChatGPT</div>
-            <div class="bm-desc">OpenAI 对话模型</div>
+            <div class="bm-desc" data-i18n="bmChatgpt">OpenAI chat model</div>
           </a>
           <a class="bookmark-card" href="https://claude.ai" target="_blank" rel="noopener">
             <div class="bm-icon">🧠</div>
             <div class="bm-name">Claude</div>
-            <div class="bm-desc">Anthropic AI 助手</div>
+            <div class="bm-desc" data-i18n="bmClaude">Anthropic AI assistant</div>
           </a>
           <a class="bookmark-card" href="https://grok.x.ai" target="_blank" rel="noopener">
             <div class="bm-icon">⚡</div>
             <div class="bm-name">Grok</div>
-            <div class="bm-desc">xAI 智能助手</div>
+            <div class="bm-desc" data-i18n="bmGrok">xAI assistant</div>
           </a>
           <a class="bookmark-card" href="https://www.notion.so" target="_blank" rel="noopener">
             <div class="bm-icon">📝</div>
             <div class="bm-name">Notion</div>
-            <div class="bm-desc">全能笔记与协作</div>
+            <div class="bm-desc" data-i18n="bmNotion">All-in-one notes &amp; collaboration</div>
           </a>
           <a class="bookmark-card" href="https://excalidraw.com" target="_blank" rel="noopener">
             <div class="bm-icon">📐</div>
             <div class="bm-name">Excalidraw</div>
-            <div class="bm-desc">手绘风格白板</div>
+            <div class="bm-desc" data-i18n="bmExcalidraw">Hand-drawn style whiteboard</div>
           </a>
         </div>
       </div>
 
       <div class="category">
-        <h3>📖 学习资源</h3>
+        <h3 data-i18n="catLearn">📖 Learning Resources</h3>
         <div class="bookmark-grid">
           <a class="bookmark-card" href="https://developer.mozilla.org" target="_blank" rel="noopener">
             <div class="bm-icon">📖</div>
             <div class="bm-name">MDN Web Docs</div>
-            <div class="bm-desc">Web 技术权威文档</div>
+            <div class="bm-desc" data-i18n="bmMdn">Authoritative web docs</div>
           </a>
           <a class="bookmark-card" href="https://css-tricks.com" target="_blank" rel="noopener">
             <div class="bm-icon">🎯</div>
             <div class="bm-name">CSS-Tricks</div>
-            <div class="bm-desc">CSS 技巧与教程</div>
+            <div class="bm-desc" data-i18n="bmCsstricks">CSS tips &amp; tutorials</div>
           </a>
           <a class="bookmark-card" href="https://javascript.info" target="_blank" rel="noopener">
             <div class="bm-icon">🟨</div>
             <div class="bm-name">JavaScript.info</div>
-            <div class="bm-desc">现代 JS 教程</div>
+            <div class="bm-desc" data-i18n="bmJsinfo">Modern JS tutorial</div>
           </a>
           <a class="bookmark-card" href="https://web.dev" target="_blank" rel="noopener">
             <div class="bm-icon">🌐</div>
             <div class="bm-name">web.dev</div>
-            <div class="bm-desc">Google Web 指南</div>
+            <div class="bm-desc" data-i18n="bmWebdev">Google web guides</div>
           </a>
         </div>
       </div>
     </section>
 
     <section id="about" style="text-align:center; padding: 40px 0; color: var(--muted);">
-      <p>混淆在浏览器端运行，不会上传任何数据。</p>
-      <p style="margin-top:8px; font-size:0.85rem;">混淆引擎：javascript-obfuscator（CDN 优先，失败回退服务端本地文件）</p>
+      <p data-i18n="aboutPrivacy">Obfuscation runs entirely in your browser — no data is uploaded.</p>
+      <p style="margin-top:8px; font-size:0.85rem;" data-i18n="aboutEngine">Engine: javascript-obfuscator (CDN first, automatic fallback to the local server copy)</p>
     </section>
   </main>
 
   <footer>
-    <p>DevTools · 仅供学习交流</p>
+    <p data-i18n="footer">DevTools · For learning &amp; exchange only</p>
   </footer>
 
-  <div class="toast" id="toast">已复制到剪贴板</div>
+  <div class="toast" id="toast" data-i18n="toastCopied">Copied to clipboard</div>
 
 <script>
+  // ========== 多语言：默认英文，浏览器语言为中文时自动切换 ==========
+  const LANG = (navigator.language || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+  document.documentElement.lang = LANG === 'zh' ? 'zh-CN' : 'en';
+  const I18N = {
+    en: {
+      "title": "DevTools · UUID Generator & JS Obfuscator",
+      "navTools": "Tools",
+      "navBookmarks": "Bookmarks",
+      "navAbout": "About",
+      "heroBadge": "🔒 Server-loaded · Pro-grade obfuscation · Zero upload",
+      "heroTitle": "UUID Generator & Pro JS Obfuscator",
+      "heroDesc": "The obfuscation engine loads from the CDN first and falls back to the local server copy automatically. Control flow flattening, string encryption, dead code injection and more — plus a curated bookmark collection.",
+      "uuidTitle": "UUID Generator",
+      "btnGenerate": "Generate UUID",
+      "btnBatch": "Batch ×5",
+      "btnClear": "Clear",
+      "uuidHint": "Click a button above to generate",
+      "copy": "Copy",
+      "copied": "Copied",
+      "obfTitle": "Pro JS Obfuscator",
+      "obfSub": "javascript-obfuscator local engine",
+      "presetLow": "Low",
+      "presetMedium": "Medium",
+      "presetHigh": "High",
+      "btnObfuscate": "Obfuscate",
+      "btnCopyResult": "Copy result",
+      "optCompact": "Compact",
+      "optControlFlow": "Control flow flattening",
+      "optDeadCode": "Dead code injection",
+      "optStringArray": "String array",
+      "optStringEncode": "String encryption",
+      "optSelfDefending": "Self defending",
+      "optRenameGlobals": "Rename globals",
+      "optNumbersToExpr": "Numbers to expressions",
+      "phInput": "Paste your JavaScript code...",
+      "phOutput": "Obfuscated result will appear here...",
+      "bmSection": "Curated Bookmarks",
+      "catDev": "🛠 Dev Tools",
+      "catDesign": "🎨 Design Inspiration",
+      "catAi": "🤖 AI & Productivity",
+      "catLearn": "📖 Learning Resources",
+      "bmGithub": "Code hosting & collaboration",
+      "bmCodepen": "Front-end sandbox",
+      "bmStackoverflow": "Programming Q&A community",
+      "bmCaniuse": "Browser compatibility tables",
+      "bmRegex101": "Regex debugger",
+      "bmJsonfmt": "JSON formatting tool",
+      "bmDribbble": "Designer portfolio showcase",
+      "bmFigma": "Collaborative design tool",
+      "bmCoolors": "Color palette generator",
+      "bmGfonts": "Free web fonts",
+      "bmAwwwards": "Web design awards",
+      "bmChatgpt": "OpenAI chat model",
+      "bmClaude": "Anthropic AI assistant",
+      "bmGrok": "xAI assistant",
+      "bmNotion": "All-in-one notes & collaboration",
+      "bmExcalidraw": "Hand-drawn style whiteboard",
+      "bmMdn": "Authoritative web docs",
+      "bmCsstricks": "CSS tips & tutorials",
+      "bmJsinfo": "Modern JS tutorial",
+      "bmWebdev": "Google web guides",
+      "aboutPrivacy": "Obfuscation runs entirely in your browser — no data is uploaded.",
+      "aboutEngine": "Engine: javascript-obfuscator (CDN first, automatic fallback to the local server copy)",
+      "footer": "DevTools · For learning & exchange only",
+      "toastCopied": "Copied to clipboard",
+      "statusEngineFail": "❌ Obfuscation engine failed to load — check your network and refresh",
+      "statusEngineOk": "✅ Pro obfuscation engine ready",
+      "toastEngineMissing": "Obfuscation engine not loaded — check your network and refresh",
+      "toastNeedCode": "Please enter some code first",
+      "statusWorking": "Obfuscating, please wait...",
+      "statusDone": "✅ Obfuscation complete",
+      "toastDone": "Obfuscation complete",
+      "statusFailPrefix": "❌ Obfuscation failed: ",
+      "statsLine": "Original <span>{orig}</span> chars → obfuscated <span>{obf}</span> chars ({ratio}%)",
+      "toastNothing": "Nothing to copy yet",
+      "toastResultCopied": "Obfuscated result copied",
+      "toastCopyFail": "Copy failed — please select and copy manually",
+      "toastUuidCopied": "UUID copied"
+    },
+    zh: {
+      "title": "DevTools · UUID 生成 & JS 混淆",
+      "navTools": "工具",
+      "navBookmarks": "书签",
+      "navAbout": "关于",
+      "heroBadge": "🔒 服务端加载 · 专业级混淆 · 零上传",
+      "heroTitle": "UUID 生成 & 专业 JS 混淆",
+      "heroDesc": "混淆引擎优先从 CDN 加载，失败时自动回退服务端本地文件；支持控制流平坦化、字符串加密、死代码注入等专业能力，同时保留精选书签导航。",
+      "uuidTitle": "UUID 生成器",
+      "btnGenerate": "生成 UUID",
+      "btnBatch": "批量 ×5",
+      "btnClear": "清空",
+      "uuidHint": "点击上方按钮生成",
+      "copy": "复制",
+      "copied": "已复制",
+      "obfTitle": "专业 JS 混淆",
+      "obfSub": "javascript-obfuscator 本地引擎",
+      "presetLow": "低强度",
+      "presetMedium": "中等",
+      "presetHigh": "高强度",
+      "btnObfuscate": "开始混淆",
+      "btnCopyResult": "复制结果",
+      "optCompact": "压缩",
+      "optControlFlow": "控制流平坦化",
+      "optDeadCode": "死代码注入",
+      "optStringArray": "字符串数组",
+      "optStringEncode": "字符串加密",
+      "optSelfDefending": "自我保护",
+      "optRenameGlobals": "重命名全局",
+      "optNumbersToExpr": "数字转表达式",
+      "phInput": "粘贴你的 JavaScript 代码...",
+      "phOutput": "混淆结果将显示在这里...",
+      "bmSection": "精选书签",
+      "catDev": "🛠 开发工具",
+      "catDesign": "🎨 设计灵感",
+      "catAi": "🤖 AI & 效率",
+      "catLearn": "📖 学习资源",
+      "bmGithub": "代码托管与协作",
+      "bmCodepen": "前端沙盒实验",
+      "bmStackoverflow": "程序员问答社区",
+      "bmCaniuse": "浏览器兼容性查询",
+      "bmRegex101": "正则表达式调试",
+      "bmJsonfmt": "JSON 格式化工具",
+      "bmDribbble": "设计师作品展示",
+      "bmFigma": "协作式设计工具",
+      "bmCoolors": "配色方案生成",
+      "bmGfonts": "免费网页字体",
+      "bmAwwwards": "优秀网页设计奖",
+      "bmChatgpt": "OpenAI 对话模型",
+      "bmClaude": "Anthropic AI 助手",
+      "bmGrok": "xAI 智能助手",
+      "bmNotion": "全能笔记与协作",
+      "bmExcalidraw": "手绘风格白板",
+      "bmMdn": "Web 技术权威文档",
+      "bmCsstricks": "CSS 技巧与教程",
+      "bmJsinfo": "现代 JS 教程",
+      "bmWebdev": "Google Web 指南",
+      "aboutPrivacy": "混淆在浏览器端运行，不会上传任何数据。",
+      "aboutEngine": "混淆引擎：javascript-obfuscator（CDN 优先，失败回退服务端本地文件）",
+      "footer": "DevTools · 仅供学习交流",
+      "toastCopied": "已复制到剪贴板",
+      "statusEngineFail": "❌ 混淆引擎加载失败，请检查网络后刷新重试",
+      "statusEngineOk": "✅ 专业混淆引擎已就绪",
+      "toastEngineMissing": "混淆引擎未加载，请检查网络后刷新重试",
+      "toastNeedCode": "请先输入代码",
+      "statusWorking": "正在混淆，请稍候...",
+      "statusDone": "✅ 混淆完成",
+      "toastDone": "专业混淆完成",
+      "statusFailPrefix": "❌ 混淆失败：",
+      "statsLine": "原始 <span>{orig}</span> 字符 → 混淆后 <span>{obf}</span> 字符（{ratio}%）",
+      "toastNothing": "没有可复制的内容",
+      "toastResultCopied": "已复制混淆结果",
+      "toastCopyFail": "复制失败，请手动选中复制",
+      "toastUuidCopied": "UUID 已复制"
+    }
+  };
+  function t(key, vars) {
+    let s = (I18N[LANG] && I18N[LANG][key]) || I18N.en[key] || key;
+    if (vars) for (const k of Object.keys(vars)) s = s.replaceAll('{' + k + '}', String(vars[k]));
+    return s;
+  }
+  function applyI18n() {
+    document.title = t('title');
+    document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.getAttribute('data-i18n')); });
+    document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.placeholder = t(el.getAttribute('data-i18n-ph')); });
+  }
+  applyI18n();
+
   // 检查混淆引擎是否加载成功（CDN 优先，失败时已回退本地文件）
   window.addEventListener('DOMContentLoaded', () => {
     const status = document.getElementById('statusBar');
     if (typeof JavaScriptObfuscator === 'undefined') {
       status.className = 'status-bar error';
-      status.textContent = '❌ 混淆引擎加载失败，请检查网络后刷新重试';
+      status.textContent = t('statusEngineFail');
     } else {
       status.className = 'status-bar ok';
-      status.textContent = '✅ 专业混淆引擎已就绪';
+      status.textContent = t('statusEngineOk');
     }
   });
 
@@ -694,7 +875,7 @@
       item.className = 'uuid-item';
       item.innerHTML = `
         <code>${id}</code>
-        <button class="copy-btn" onclick="copyText(this, '${id}')">复制</button>
+        <button class="copy-btn" onclick="copyText(this, '${id}')">${t('copy')}</button>
       `;
       list.prepend(item);
     }
@@ -703,8 +884,8 @@
   function clearUUIDs() {
     document.getElementById('uuidList').innerHTML = `
       <div class="uuid-item">
-        <code id="firstUuid">点击上方按钮生成</code>
-        <button class="copy-btn" onclick="copyText(this, document.getElementById('firstUuid').textContent)">复制</button>
+        <code id="firstUuid">${t('uuidHint')}</code>
+        <button class="copy-btn" onclick="copyText(this, document.getElementById('firstUuid').textContent)">${t('copy')}</button>
       </div>`;
   }
 
@@ -798,18 +979,18 @@
 
   function runObfuscate() {
     if (typeof JavaScriptObfuscator === 'undefined') {
-      showToast('混淆引擎未加载，请检查网络后刷新重试');
+      showToast(t('toastEngineMissing'));
       return;
     }
     const code = document.getElementById('jsInput').value;
     if (!code.trim()) {
-      showToast('请先输入代码');
+      showToast(t('toastNeedCode'));
       return;
     }
 
     const status = document.getElementById('statusBar');
     status.className = 'status-bar';
-    status.textContent = '正在混淆，请稍候...';
+    status.textContent = t('statusWorking');
 
     setTimeout(() => {
       try {
@@ -820,14 +1001,14 @@
 
         const ratio = ((obfuscated.length / code.length) * 100).toFixed(1);
         document.getElementById('obfStats').innerHTML =
-          `原始 <span>${code.length}</span> 字符 → 混淆后 <span>${obfuscated.length}</span> 字符（${ratio}%）`;
+          t('statsLine', { orig: code.length, obf: obfuscated.length, ratio });
 
         status.className = 'status-bar ok';
-        status.textContent = '✅ 混淆完成';
-        showToast('专业混淆完成');
+        status.textContent = t('statusDone');
+        showToast(t('toastDone'));
       } catch (err) {
         status.className = 'status-bar error';
-        status.textContent = '❌ 混淆失败：' + (err.message || err);
+        status.textContent = t('statusFailPrefix') + (err.message || err);
         console.error(err);
       }
     }, 30);
@@ -864,27 +1045,27 @@
   function copyObfuscated() {
     const text = document.getElementById('jsOutput').value;
     if (!text) {
-      showToast('没有可复制的内容');
+      showToast(t('toastNothing'));
       return;
     }
-    writeClipboard(text).then(ok => showToast(ok ? '已复制混淆结果' : '复制失败，请手动选中复制'));
+    writeClipboard(text).then(ok => showToast(ok ? t('toastResultCopied') : t('toastCopyFail')));
   }
 
   // ========== 通用 ==========
   function copyText(btn, text) {
-    if (!text || text === '点击上方按钮生成') return;
+    if (!text || text === t('uuidHint')) return;
     writeClipboard(text).then(ok => {
       if (!ok) {
-        showToast('复制失败，请手动选中复制');
+        showToast(t('toastCopyFail'));
         return;
       }
-      btn.textContent = '已复制';
+      btn.textContent = t('copied');
       btn.classList.add('copied');
       setTimeout(() => {
-        btn.textContent = '复制';
+        btn.textContent = t('copy');
         btn.classList.remove('copied');
       }, 1500);
-      showToast('UUID 已复制');
+      showToast(t('toastUuidCopied'));
     });
   }
 
