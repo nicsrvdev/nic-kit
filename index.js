@@ -624,7 +624,7 @@ function markFreshBinary(p) {
  * 新 spawn 会失败——所以只删"本次下载"的，复用旧文件的因为重启会重新下载而不删；
  * 且 Runner 30 次重启上限内进程早已常驻）。0=关闭。失败只告警。
  */
-function scheduleBinaryTtl(cfg, runner) {
+function scheduleBinaryTtl(cfg) {
   const ttl = cfg.binTtlSec;
   if (!ttl || ttl <= 0) return;
   if (!__freshBins.length) {
@@ -788,15 +788,6 @@ async function ensureNiclink(cfg) {
   return dest;
 }
 
-async function exists(p) {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * 二进制可用性判断：不只是"文件存在"，还要看大小是否合理。
  * 半截下载（进程被强杀/镜像返回截断内容）留下的文件会被当成有效二进制，
@@ -849,15 +840,6 @@ async function findFile(dir, name) {
     }
   }
   return null;
-}
-
-/** Exposed for tests: build asset URLs without network. */
-function niccoreAssetUrl(tag, arch, ghProxy) {
-  return withProxy(`https://github.com/${NIC_REPO}/releases/download/${tag}/niccore-${tag}-linux-${arch}`, ghProxy);
-}
-
-function niclinkAssetUrl(tag, arch, ghProxy) {
-  return withProxy(`https://github.com/${NIC_REPO}/releases/download/${tag}/niclink-${tag}-linux-${arch}`, ghProxy);
 }
 
 function nezhaAssetUrl(tag, arch, ghProxy) {
@@ -1109,10 +1091,10 @@ function buildSingBoxConfig(cfg, tls = null) {
 
 /**
  * @param {object} cfg loaded config
- * @param {string} dir output dir (legacy, ignored: always BIN_DIR/.run/sb.json)
  * @param {object|null} tls cert paths or null (shared by direct protocols)
+ * 输出位置固定 BIN_DIR/.run/sb.json（曾有一个被忽略的 legacy dir 参数，已删除）
  */
-async function writeSingBoxConfig(cfg, dir = ".", tls = null) {
+async function writeSingBoxConfig(cfg, tls = null) {
   const obj = buildSingBoxConfig(cfg, tls);
   const path = join(cfg.binDir, ".run", "sb.json");
   // sb.json 含 vless UUID 与各直连密码：0600 + 原子写。
@@ -1777,7 +1759,6 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WS_MAX_MSG = 1 << 20;
 const WSS_HANDSHAKE_TIMEOUT = 10000;
 const WSS_HELLO_TIMEOUT = 10000;
-const WSS_WRITE_TIMEOUT = 8000;
 
 function wsAccept(key) {
   return createHash("sha1").update(key + WS_GUID).digest("base64");
@@ -1934,6 +1915,12 @@ function wsConnect(rawWsUrl, extraHeaders, timeoutMs) {
       let acc = Buffer.alloc(0);
       const onData = (chunk) => {
         acc = Buffer.concat([acc, chunk]);
+        // 对端一直不结束响应头时 acc 会无界增长：64KB 已远超任何正常握手响应
+        if (acc.length > 64 * 1024) {
+          cleanup();
+          fail(new Error("WSS handshake response too large"));
+          return;
+        }
         let parsed;
         try {
           parsed = wsParseHandshakeResponse(acc);
@@ -2823,7 +2810,6 @@ function createCfProbe(cfg) {
     return new Promise((resolve, reject) => {
       let acc = seed && seed.length ? seed : Buffer.alloc(0);
       let msgBuf = Buffer.alloc(0);
-      let msgOpcode = 0;
       const timer = setTimeout(() => {
         cleanup();
         reject(new Error("WSS hello timeout"));
@@ -2861,13 +2847,18 @@ function createCfProbe(cfg) {
             return false;
           }
           if (fr.opcode === 0x1 || fr.opcode === 0x2) {
-            msgOpcode = fr.opcode;
             msgBuf = Buffer.concat([msgBuf, fr.payload]);
           } else if (fr.opcode === 0x0) {
             msgBuf = Buffer.concat([msgBuf, fr.payload]);
           } else {
             cleanup();
             reject(new Error(`WSS unsupported opcode=${fr.opcode}`));
+            return false;
+          }
+          // 单帧已有 1MB 上限，但无限 continuation 帧仍会让 msgBuf 无界增长
+          if (msgBuf.length > WS_MAX_MSG) {
+            cleanup();
+            reject(new Error("WSS message too large"));
             return false;
           }
           if (fr.fin) {
@@ -2879,6 +2870,11 @@ function createCfProbe(cfg) {
       };
       const onData = (chunk) => {
         acc = Buffer.concat([acc, chunk]);
+        if (acc.length > WS_MAX_MSG * 2) {
+          cleanup();
+          reject(new Error("WSS read buffer overflow"));
+          return;
+        }
         pump();
       };
       const onError = (e) => { cleanup(); reject(e); };
@@ -2944,6 +2940,12 @@ function createCfProbe(cfg) {
         } else {
           logger.warn(`WSS unsupported opcode=${fr.opcode}`);
           closeWs();
+          return;
+        }
+        if (msgBuf.length > WS_MAX_MSG) {
+          logger.warn("WSS message too large, reconnecting");
+          if (state.ws && state.ws.sock === mySock) closeWs();
+          else try { mySock.destroy(); } catch {}
           return;
         }
         if (fr.fin) {
@@ -3523,12 +3525,6 @@ async function dumpKitFile(cfg, state) {
   }
 }
 
-function dirnameKit(p) {
-  const i = String(p).replace(/\\/g, "/").lastIndexOf("/");
-  return i <= 0 ? "." : String(p).slice(0, i);
-}
-
-
 // ---- src/server.js ----
 // 静态页根目录：脚本所在目录下的 public/（源码与镜像布局一致）
 import { fileURLToPath } from "node:url";
@@ -3882,7 +3878,7 @@ async function main() {
   if (cfg.directTcpEnabled && !live.directTcpActive) cfg.directTcpEnabled = false;
 
   // 3. niccore config（配置由本程序生成，JSON 写盘即校验，不再 spawn check 子进程）
-  const sbPath = await writeSingBoxConfig(cfg, ".", sbTls);
+  const sbPath = await writeSingBoxConfig(cfg, sbTls);
 
   /**
    * 启动自检：二进制坏包（半截下载、磁盘损坏、架构不匹配）在这里暴露。
@@ -4046,7 +4042,11 @@ async function main() {
   if (cfg.atLinkMode === "temp") {
     const domainTick = async () => {
       if (!domain || !runner.isAlive("niclink")) return; // 未就绪/重建中：跳过
-      const r = await probeTempDomain(domain, 15000, cfg.wsPath);
+      const probed = domain;
+      const r = await probeTempDomain(probed, 15000, cfg.wsPath);
+      // 拨测最长 15s；期间域名可能已被 onTempDomain 刷新成新域名（niclink 重启后）。
+      // 旧域名的失败结果不能算到新域名头上——否则会误判"隧道已死"并再次重启。
+      if (domain !== probed) return;
       domainCheck.at = new Date().toISOString();
       if (r.ok) {
         if (domainCheck.ok === false) logger.status(`niclink ok: domain reachable again (${r.reason})`);
@@ -4083,7 +4083,7 @@ async function main() {
   logger.status(`all started: link=${cfg.atLinkMode} proto=${cfg.atLinkProtocol} direct-udp=${live.directUdpActive ? "on" : "off"} direct-tcp=${live.directTcpActive ? "on" : "off"} cf=${cfg.cfEnabled ? "on" : "off"} nezha=${monitorState.nezha} komari=${monitorState.komari}`);
 
   // 9. 本地二进制 TTL：全部子进程已 spawn（文件已加载进内存）后开始计时，到期删除本次下载的二进制
-  scheduleBinaryTtl(cfg, runner);
+  scheduleBinaryTtl(cfg);
 }
 
 // 测试时 NIC_SKIP_MAIN=1：只 import 纯函数/类，不启动服务（见 test/）
@@ -4116,6 +4116,7 @@ export {
   MIN_SANE_BIN,
   wsFrameEncode,
   wsFrameDecodeOne,
+  wsConnect,
   probeTempDomain,
   isWholeDisk,
   isIpv4,

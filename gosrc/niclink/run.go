@@ -94,7 +94,8 @@ func runQuickLink(c *cli.Context) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// 限长读：对端（api.trycloudflare.com）异常时也不至于把内存吃爆
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return errors.Wrap(err, "failed to read quick link response")
 	}

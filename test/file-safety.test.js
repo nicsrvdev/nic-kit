@@ -57,7 +57,7 @@ test("sb.json 必须是 0600 且为完整 JSON", { timeout: 30000 }, async () =>
       directTcpPort: 4433,
       directTcpSni: "www.nvidia.com",
     };
-    const p = await writeSingBoxConfig(cfg, dir, null);
+    const p = await writeSingBoxConfig(cfg, null); // 第二参数是 tls（legacy dir 参数已删除）
     assert.equal(p, join(dir, ".run", "sb.json"));
     const st = await stat(p);
     assert.equal(st.mode & 0o777, 0o600, "sb.json 含密钥，权限必须是 0600");

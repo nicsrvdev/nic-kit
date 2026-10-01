@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box"
-	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/certificate"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -75,8 +74,3 @@ func Certificates() *certificate.Registry {
 	originca.RegisterCertificateProvider(r)
 	return r
 }
-
-var (
-	_ = adapter.Inbound(nil)
-	_ = certificate.Registry{}
-)
