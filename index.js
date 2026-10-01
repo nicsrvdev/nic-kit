@@ -1192,19 +1192,13 @@ function watchLinkOutput(child, onDomain) {
   return () => found;
 }
 
-/** 拨测 temp 域名是否存活：纯 HTTPS GET /（可达即活；502/503=隧道真死；超时/网络异常算"可疑"）。
- * 注意：fetch 不允许手拼 Upgrade 头（undici 直接抛 invalid upgrade header），
- * 所以这里只能是普通 GET——它验证的是 edge 可达 + 源站有响应，足够做存活判断。 */
+/** 通过 WebSocket 握手探测临时域名；正确路径返回 101，502/503 判死。 */
 async function probeTempDomain(domain, timeoutMs = 15000, wsPath = "/link", connectFn = wsConnect) {
   const host = String(domain || "").replace(/^https?:\/\//, "").replace(/\/+$/, "");
   if (!host) return { ok: false, reason: "empty" };
   const path = normalizeWsPath(wsPath || "/link");
   try {
-    // 用真实客户端同款 WS 握手探测（GET <wsPath> + Upgrade 头），而不是裸 GET /：
-    // 裸 GET 会打到 vless-link 入站的错误路径上，niccore 每分钟记一条
-    // `ERROR inbound/v[link]: bad path: /`，日志噪音极大且看着像故障。
-    // WS 握手带正确的路径：路径配对时 niccore 正常接受（101），日志干净；
-    // 顺带还验证了"隧道 + WS 路径"这条真实链路是通的。
+    // 使用配置的 WS 路径；裸 GET / 会落到错误入站路径。
     const { sock } = await connectFn(
       `wss://${host}${path}`,
       { "User-Agent": "nic-kit-domaincheck" },
@@ -3319,7 +3313,7 @@ class Runner {
     // 按"完整行"处理：残行留到下一个 chunk 拼回（见 makeLineSplitter 注释）。
     const handleLine = (line) => {
       logger.debug(`[${name}] ${line.length > 2000 ? line.slice(0, 2000) + " …" : line}`);
-      // niccore 的"非 vless 连接"噪音（含我们自己的存活拨测）降到 debug 并计数
+      // 过滤预期的入站拒绝，避免升级成 WARN。
       if (name === "niccore" && isLinkInboundNoise(line)) return;
       if (/ERR|error|panic|failed|Couldn't/i.test(line)) {
         logger.warn(`[${name}] ${line.length > 300 ? line.slice(0, 300) : line}`);
@@ -3446,24 +3440,14 @@ class Runner {
 }
 
 // --- niccore 逐连接日志降噪 ---------------------------------------------------
-// vless-link 入站只接受「WS + vless」流量；任何其它连接（包括我们每 60s 一次的
-// 域名存活拨测、以及用户用浏览器/curl 直接访问隧道域名）都会让 niccore 记一条 ERROR：
-//   inbound/v[link]: process connection from <ip>:<port>: bad path: /
-//   inbound/v[link]: process connection from <ip>:<port>: EOF
-//   inbound/v[link]: process connection from <ip>:<port>: upgrade websocket connection: handshake error: ...
-// 这是逐连接噪音而不是故障（拨测本身靠它拿到 404/400 判活）。默认降到 debug，
-// 同时计数，/health 里以 link_bad_requests 暴露；要逐条看把 LOG_LEVEL=debug 即可。
+// 入站仅接受配置路径上的 VLESS-over-WS；其他请求拒绝时会写 ERROR。
+// 这类预期拒绝降至 debug，并在 /health 计数。
 const linkNoise = { count: 0, lastAt: "" };
-// makeLineSplitter 已保证这里收到的是完整日志行，因此锚定行尾，避免把带额外错误文本的行误吞。
-// 来源地址既可能是 IPv4/主机名，也可能是 Go net 包方括号包裹的 IPv6
-//（如 `[2001:db8::1]:55096`）；IPv6 的冒号必须作为地址的一部分接受，地址匹配须显式支持方括号。
+// 按完整行匹配；IPv6 来源地址带方括号。
 const LINK_NOISE_RE =
   /inbound\/v\[link\]: process connection from (?:\[[^\]\s]+\]|[^\s:]+):\d+: (EOF|bad path: \S*|upgrade websocket connection: handshake error[^\r\n]*)$/;
 function isLinkInboundNoise(line) {
-  // 关键：niccore 原始输出是 `inbound/vless[vless-link]: ...`，
-  // 日志展示层 cleanLog 才会把它中性化成 `inbound/v[link]: ...`。
-  // 直接拿原始字节去匹配"展示用"的正则会永远失配（实测踩过：link_bad_requests 一直 0，
-  // 而日志里看到的行是被清洗过的，肉眼和字节级抽样都会骗过验证）。
+  // 先按日志展示规则归一化协议名，再匹配。
   const shown = cleanLog(String(line));
   if (!LINK_NOISE_RE.test(shown)) return false;
   linkNoise.count += 1;
