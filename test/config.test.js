@@ -120,3 +120,31 @@ test("报错本身不会因为脏值而折行（日志里不会被误读成别�
     }
   );
 });
+
+// VLESS_PORT -> AT_LINK_PORT 改名（隧道目标端口归入链路分组，旧名不再识别）
+test("AT_LINK_PORT 默认 18000", () => {
+  const cfg = withEnv({ UUID, AT_LINK_PORT: undefined, VLESS_PORT: undefined }, () => loadConfig());
+  assert.equal(cfg.corePort, 18000);
+});
+
+test("AT_LINK_PORT 自定义值生效", () => {
+  const cfg = withEnv({ UUID, AT_LINK_PORT: "19000", VLESS_PORT: undefined }, () => loadConfig());
+  assert.equal(cfg.corePort, 19000);
+});
+
+test("旧 VLESS_PORT 不再识别：填了也回默认 18000", () => {
+  const cfg = withEnv({ UUID, AT_LINK_PORT: undefined, VLESS_PORT: "19003" }, () => loadConfig());
+  assert.equal(cfg.corePort, 18000);
+  assert.ok(!cfg.warnings.some((w) => w.includes("VLESS_PORT")));
+});
+
+test("AT_LINK_PORT 非法值：抛 ECONFIG 且报错点新名", () => {
+  assert.throws(
+    () => withEnv({ UUID, AT_LINK_PORT: "0", VLESS_PORT: undefined }, () => loadConfig()),
+    (e) => {
+      assert.equal(e.code, "ECONFIG");
+      assert.match(e.message, /AT_LINK_PORT must be 1-65535/);
+      return true;
+    }
+  );
+});

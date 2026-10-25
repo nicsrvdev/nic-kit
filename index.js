@@ -5,9 +5,9 @@ const USER_CONFIG = {
   UUID: "",        // 必填：vless 的 UUID，例如 "11111111-2222-4333-8444-555555555555"
   PORT: "",        // HTTP 端口（/health /sub /kit /），默认 3000；PaaS 会自动注入 PORT 时不用填
   WS_PATH: "",     // 链路 ws 路径，默认 /link
-  VLESS_PORT: "",  // 内部转发端口，niccore 听 127.0.0.1、niclink 转发到它；默认18000，被占用才改
 
   // ---- 链路 ----
+  AT_LINK_PORT: "",    // 隧道目标端口：niccore 听 127.0.0.1、niclink 转发到它；默认18000，被占用才改
   AT_LINK_MODE: "",    // token=固定域名 temp=临时域名，默认 temp
   AT_LINK_TOKEN: "",   // AT_LINK_MODE=token 时必填：链路 Token
   AT_LINK_DOMAIN: "",  // AT_LINK_MODE=token 时必填：已绑定的域名
@@ -83,7 +83,7 @@ import { pipeline } from "node:stream/promises";
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3, off: 4 };
 
 // 日志脱敏：协议名不落日志，所有 logger 出口统一过一遍。
-// 全大写 ENV_VAR 风格 token（如 HY2_PORT/VLESS_PORT）原样保留，否则警告没法定位变量。
+// 全大写 ENV_VAR 风格 token（如 HY2_PORT/AT_LINK_PORT）原样保留，否则警告没法定位变量。
 function cleanLog(s) {
   const str = String(s);
   const kept = [];
@@ -205,7 +205,7 @@ function loadConfig() {
     port: int("PORT", 3000),
     uuid: str("UUID", ""),
     wsPath: normalizeWsPath(str("WS_PATH", "/link")),
-    corePort: int("VLESS_PORT", 18000),
+    corePort: int("AT_LINK_PORT", 18000),
 
     atLinkMode: str("AT_LINK_MODE", "temp").toLowerCase(),
     atLinkToken: str("AT_LINK_TOKEN", ""),
@@ -335,7 +335,7 @@ function loadConfig() {
     errors.push(`PORT must be 1-65535, got: ${cfg.port}`);
   }
   if (!Number.isInteger(cfg.corePort) || cfg.corePort < 1 || cfg.corePort > 65535) {
-    errors.push(`VLESS_PORT must be 1-65535, got: ${cfg.corePort}`);
+    errors.push(`AT_LINK_PORT must be 1-65535, got: ${cfg.corePort}`);
   }
   // HY2/VLESS直连：只填 PORT 即开启；密码留空用 UUID 派生（各协议盐不同）；
   // HOST 留空启动后自动获取公网 IP。端口非法只警告降级，不断线。

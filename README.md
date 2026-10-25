@@ -32,7 +32,8 @@ docker rmi ghcr.io/nicsrvdev/nic-kit:latest
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `PORT` / `WS_PATH` / `VLESS_PORT` | `3000` / `/link` / `18000` | HTTP 端口 / ws 路径 / 内部端口 |
+| `PORT` / `WS_PATH` | `3000` / `/link` | HTTP 端口 / ws 路径 |
+| `AT_LINK_PORT` | `18000` | 隧道目标端口：niccore 听 127.0.0.1、niclink 转发到它；被占用才改 |
 | `AT_LINK_MODE` / `AT_LINK_TOKEN` / `AT_LINK_DOMAIN` | `temp` | `token` 需配齐后两者 |
 | `AT_LINK_PROTOCOL` | `quic` | edge 传输协议：`quic`/`http2`/`auto`（QUIC 被 QoS 时填 `http2` 逃生） |
 | `AT_LINK_CONNECTIONS` | `4` | edge 连接数（`1`-`16`）；填 `1` 最省内存 |
