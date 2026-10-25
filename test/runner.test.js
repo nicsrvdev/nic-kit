@@ -137,3 +137,33 @@ test("_onError: ENOENT 走 refetch，随后 exit 不重复处理", async () => {
   assert.equal(r.restarts.get("svc") || 0, 0);
   r.stop("svc", true);
 });
+
+// refetch 失败空路径重启（第二轮 review）：空 bin 不再排定时器，直接放弃
+test("scheduleRestart 空路径：直接放弃，不排定时器", () => {
+  const r = new Runner();
+  let fired = 0;
+  r.onGiveUp("svc", () => { fired++; });
+  r.scheduleRestart("svc", "", [], {}, "test");
+  assert.equal(fired, 1);
+  assert.equal(r.timers.has("svc"), false);
+  assert.equal(r.restarts.get("svc") || 0, 0); // 守卫在计数前返回，不消耗重启次数
+});
+
+test("refetch 失败：用上次的 bin 退避重试", async () => {
+  const r = new Runner();
+  r.onMissingBinary("svc", async () => { throw new Error("dl fail"); });
+  r.lastSpawn.set("svc", { bin: "/prev/bin", args: [], opts: {} });
+  await r.refetch("svc", [], {});
+  assert.equal(r.timers.has("svc"), true); // 退避重试已安排，不是直接放弃
+  r.stop("svc", true); // 清掉 pending 的退避 timer
+});
+
+test("refetch 失败且无上次记录：直接放弃", async () => {
+  const r = new Runner();
+  let fired = 0;
+  r.onGiveUp("svc", () => { fired++; });
+  r.onMissingBinary("svc", async () => { throw new Error("dl fail"); });
+  await r.refetch("svc", [], {});
+  assert.equal(fired, 1);
+  assert.equal(r.timers.has("svc"), false);
+});

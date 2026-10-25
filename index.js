@@ -1562,10 +1562,6 @@ async function bootTimeMs() {
     const m = text.match(/^btime\s+(\d+)/m);
     if (m) return String(Number(m[1]) * 1000);
   }
-  try {
-    const { execFileSync } = await import("node:child_process");
-    void execFileSync;
-  } catch {}
   return "0";
 }
 
@@ -1986,7 +1982,7 @@ function wsConnect(rawWsUrl, extraHeaders, timeoutMs) {
 //   （1s-5min 夹逼）；error(401/403/404/1008 -> 停 120s)；409+wss_schedule_inactive -> 切 POST
 // - 退避：网络错误 60s 起指数退避上限 5min；读空闲 = 上报间隔+15s（下限 15s）
 // - never throws out; reports status via getStatus()
-const AGENT_VERSION = "nic-kit-cfprobe/0.2.0";
+const AGENT_VERSION = "nic-kit-cfprobe/0.2.0"; // 探针组件版本，独立于 package.json 的项目版本演进，上报给面板仅用于识别探针实现
 const CONFIG_SCHEMA = "7";
 const WSS_REPORT_MIN_MS = 1000;
 const WSS_REPORT_MAX_MS = 5 * 60 * 1000;
@@ -3114,6 +3110,11 @@ function createCfProbe(cfg) {
           await new Promise((r) => setTimeout(r, 1000));
           continue;
         }
+        // 握手进行中（首帧未发完）不发：首连接时 lastWssSendAt=0，否则会和首帧并发各发一条
+        if (state.wssConnecting) {
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
         const waitMs = state.lastWssSendAt
           ? Math.max(0, state.lastWssSendAt + wssIntervalMs() - Date.now())
           : 0;
@@ -3154,13 +3155,17 @@ function createCfProbe(cfg) {
       state.ipTimer = setInterval(() => { ipTick().catch(() => {}); }, 10 * 60 * 1000);
       if (state.ipTimer.unref) state.ipTimer.unref();
       tick();
-      state.timer = setInterval(() => {
+      // 节拍按 GCD 动态重排（对齐官方 resetTimer(tickInterval)）：每次触发都按当前间隔重建，
+      // 否则面板下发新间隔后节拍会冻结在首次值（之前重建出来的回调里丢了重建逻辑，只生效一次）
+      const tickLoop = () => {
         tick().catch(() => {});
-        // 节拍按 GCD 动态重排（对齐官方 resetTimer(tickInterval)）
         try {
-          if (state.timer) { clearInterval(state.timer); state.timer = setInterval(() => tick().catch(() => {}), tickIntervalMs()); if (state.timer.unref) state.timer.unref(); }
+          if (state.timer) clearInterval(state.timer);
+          state.timer = setInterval(tickLoop, tickIntervalMs());
+          if (state.timer.unref) state.timer.unref();
         } catch {}
-      }, tickIntervalMs());
+      };
+      state.timer = setInterval(tickLoop, tickIntervalMs());
       if (state.timer.unref) state.timer.unref();
     },
     stop() {
@@ -3370,8 +3375,26 @@ class Runner {
     this.scheduleRestart(name, bin, args, opts, `spawn error: ${e.message}`);
   }
 
+  /** 放弃该进程：打状态行并触发 giveUp 钩子。 */
+  _giveUp(name, detail) {
+    logger.status(`${name} failed: ${detail}`);
+    for (const fn of this.giveUpHooks.get(name) || []) {
+      try {
+        fn();
+      } catch (e) {
+        logger.warn(`${name} giveup hook error: ${e.message}`);
+      }
+    }
+  }
+
   scheduleRestart(name, bin, args, opts, reason) {
     if (this.stopping) return;
+    if (!bin) {
+      // 空路径永远起不来：不要排一个注定同步抛错的定时器（spawn("") 是同步抛错，
+      // 穿出定时器回调后组件无声死亡），直接放弃
+      this._giveUp(name, `cannot restart with empty binary path, giving up (${reason})`);
+      return;
+    }
     // 上次 spawn 后健康运行超过阈值：清零计数，偶发崩溃不该累加上古早的次数
     const spawnedAt = this.spawnedAt.get(name) || 0;
     if (spawnedAt && Date.now() - spawnedAt > RESTART_RESET_MS) {
@@ -3380,14 +3403,7 @@ class Runner {
     const n = (this.restarts.get(name) || 0) + 1;
     this.restarts.set(name, n);
     if (n > MAX_RESTARTS) {
-      logger.status(`${name} failed: max restarts (${MAX_RESTARTS}) reached, giving up (${reason})`);
-      for (const fn of this.giveUpHooks.get(name) || []) {
-        try {
-          fn();
-        } catch (e) {
-          logger.warn(`${name} giveup hook error: ${e.message}`);
-        }
-      }
+      this._giveUp(name, `max restarts (${MAX_RESTARTS}) reached, giving up (${reason})`);
       return;
     }
     // 指数退避：5s, 10s, 20s ... 上限 60s
@@ -3423,7 +3439,10 @@ class Runner {
         this.timers.set(name, t);
       }
     } catch (e) {
-      this.scheduleRestart(name, "", args, opts, `refetch failed: ${e.message}`);
+      // 重下失败：用上次的 bin 退避重试（下次 spawn 仍 ENOENT 时会再次触发 refetch，
+      // 计数到上限后放弃）；没有上次记录时 scheduleRestart 的空路径守卫会直接放弃
+      const prev = this.lastSpawn.get(name);
+      this.scheduleRestart(name, (prev && prev.bin) || "", args, opts, `refetch failed: ${e.message}`);
     }
   }
 
@@ -4071,8 +4090,8 @@ async function main() {
         runner.restart("niclink", "domain dead, fetching fresh domain"); // 显式重启：stop() 的 exit 会被 stale guard 拦，不能靠它
       }
     };
-    // 与其他定时器一致地兜住异常：setInterval/setTimeout 的 async 回调一旦 reject，
-    // 未处理的 Promise 拒绝在 Node ≥15 默认直接终止进程（面板里就是一次"崩溃重启"）。
+    // 与其他定时器一致地兜住异常：setInterval 的 async 回调一旦 reject 就地接住，
+    // 只记 debug 日志（全局兜底也会接，但不要依赖它来消化常规异常）。
     const domainTimer = setInterval(() => { domainTick().catch((e) => logger.debug(`domain check error: ${e && e.message}`)); }, 60000);
     if (domainTimer.unref) domainTimer.unref();
     const domainOnce = setTimeout(() => { domainTick().catch(() => {}); }, 45000); // 首次 45s（错开 kit.txt 的 15s）
